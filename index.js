@@ -177,5 +177,6 @@ app.get('/analytics', authenticateToken, async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 1000, () => console.log('Server running'));
+app.listen(process.env.PORT || 3000, () => console.log('Server running'));
+
 
