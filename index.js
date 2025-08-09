@@ -5,9 +5,9 @@ const bcrypt = require('bcrypt');
 const cors = require('cors');
 
 const app = express();
-app.use(cors({ 
-  origin: ['http://localhost:8081', 'https://purerosa.web.app', 'https://purerosamilk.netlify.app'], 
-  credentials: true 
+app.use(cors({
+  origin: ['http://localhost:8081', 'https://purerosa.web.app', 'https://purerosamilk.netlify.app'],
+  credentials: true
 }));
 app.use(express.json());
 
@@ -46,14 +46,18 @@ app.post('/register', async (req, res) => {
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (email, password, name, role) VALUES ($1, $2, $3, $4) RETURNING id',
+      'INSERT INTO users (email, password, name, role) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING RETURNING id',
       [email.toLowerCase(), hashedPassword, name, role]
     );
+    if (result.rowCount === 0) {
+      console.log('User already exists:', email);
+      return res.status(400).json({ error: 'User already exists' });
+    }
     console.log('User registered:', email);
     res.status(201).json({ message: 'User registered', userId: result.rows[0].id });
   } catch (err) {
     console.error('Registration error:', err);
-    res.status(400).json({ error: 'User already exists or invalid data' });
+    res.status(500).json({ error: 'Registration failed' });
   }
 });
 
@@ -108,23 +112,23 @@ app.post('/refresh', async (req, res) => {
   }
 });
 
-// Submit Milk Production (Farmer)
+// Submit Sales Record (Seller)
 app.post('/records', authenticateToken, async (req, res) => {
-  const { liters, price_per_liter } = req.body;
-  if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0)) {
+  const { liters, price_per_liter, yogurt_type_id, amount_sold } = req.body;
+  if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0) || !yogurt_type_id || !amount_sold || amount_sold < 0) {
     console.log('Invalid data in /records:', req.body);
-    return res.status(400).json({ error: 'Invalid liters or price_per_liter' });
+    return res.status(400).json({ error: 'Invalid liters, price_per_liter, yogurt_type_id, or amount_sold' });
   }
   try {
     const result = await pool.query(
-      'INSERT INTO records (user_id, liters, price_per_liter, created_at, role) VALUES ($1, $2, $3, NOW(), $4) RETURNING id, liters, price_per_liter, created_at',
-      [req.user.id, liters, price_per_liter || null, req.user.role]
+      'INSERT INTO records (user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role) VALUES ($1, $2, $3, $4, $5, NOW(), $6) RETURNING id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at',
+      [req.user.id, liters, price_per_liter, yogurt_type_id, amount_sold, req.user.role]
     );
     console.log('Record submitted by:', req.user.email, 'Data:', result.rows[0]);
-    res.status(201).json({ 
-      id: result.rows[0].id, 
-      message: 'Record submitted successfully', 
-      data: result.rows[0] 
+    res.status(201).json({
+      id: result.rows[0].id,
+      message: 'Record submitted successfully',
+      data: result.rows[0]
     });
   } catch (err) {
     console.error('Record submission error:', err);
@@ -132,13 +136,13 @@ app.post('/records', authenticateToken, async (req, res) => {
   }
 });
 
-// Fetch Records (Farmer, Seller, Admin)
+// Fetch Records (Seller, Admin)
 app.get('/records', authenticateToken, async (req, res) => {
   try {
-    let query = 'SELECT id, user_id, liters, price_per_liter, created_at, role FROM records WHERE user_id = $1';
+    let query = 'SELECT id, user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role FROM records WHERE user_id = $1';
     const params = [req.user.id];
     if (req.user.role === 'admin') {
-      query = 'SELECT id, user_id, liters, price_per_liter, created_at, role FROM records';
+      query = 'SELECT id, user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role FROM records';
       params.length = 0;
     }
     const result = await pool.query(query, params);
@@ -150,24 +154,24 @@ app.get('/records', authenticateToken, async (req, res) => {
   }
 });
 
-// Update Record (Farmer, Admin)
+// Update Record (Seller, Admin)
 app.put('/records/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { liters, price_per_liter } = req.body;
-  if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0)) {
+  const { liters, price_per_liter, yogurt_type_id, amount_sold } = req.body;
+  if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0) || !yogurt_type_id || !amount_sold || amount_sold < 0) {
     console.log('Invalid data in /records update:', req.body);
-    return res.status(400).json({ error: 'Invalid liters or price_per_liter' });
+    return res.status(400).json({ error: 'Invalid liters, price_per_liter, yogurt_type_id, or amount_sold' });
   }
   try {
     const result = await pool.query(
-      'UPDATE records SET liters = $1, price_per_liter = $2, updated_at = NOW() WHERE id = $3 AND user_id = $4 RETURNING *',
-      [liters, price_per_liter || null, id, req.user.id]
+      'UPDATE records SET liters = $1, price_per_liter = $2, yogurt_type_id = $3, amount_sold = $4, updated_at = NOW() WHERE id = $5 AND user_id = $6 RETURNING *',
+      [liters, price_per_liter, yogurt_type_id, amount_sold, id, req.user.id]
     );
     if (result.rowCount === 0) {
       if (req.user.role === 'admin') {
         const adminResult = await pool.query(
-          'UPDATE records SET liters = $1, price_per_liter = $2, updated_at = NOW() WHERE id = $3 RETURNING *',
-          [liters, price_per_liter || null, id]
+          'UPDATE records SET liters = $1, price_per_liter = $2, yogurt_type_id = $3, amount_sold = $4, updated_at = NOW() WHERE id = $5 RETURNING *',
+          [liters, price_per_liter, yogurt_type_id, amount_sold, id]
         );
         if (adminResult.rowCount === 0) {
           console.log('Record not found for admin update:', id);
@@ -195,7 +199,7 @@ app.delete('/records/:id', authenticateToken, async (req, res) => {
   }
   const { id } = req.params;
   try {
-    const result = await pool.query('DELETE FROM records WHERE id = $1', [id]);
+    const result = await pool.query('DELETE FROM records WHERE id = $1 RETURNING *', [id]);
     if (result.rowCount === 0) {
       console.log('Record not found for deletion:', id);
       return res.status(404).json({ error: 'Record not found' });
@@ -208,6 +212,97 @@ app.delete('/records/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// Add Yogurt Type (Seller)
+app.post('/yogurt_types', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'seller') {
+    console.log('Seller access denied for:', req.user.email, 'on', req.path);
+    return res.status(403).json({ error: 'Seller access required' });
+  }
+  const { name } = req.body;
+  if (!name) {
+    console.log('Missing name in /yogurt_types:', req.body);
+    return res.status(400).json({ error: 'Name is required' });
+  }
+  try {
+    const result = await pool.query(
+      'INSERT INTO yogurt_types (name, created_by) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING RETURNING id',
+      [name, req.user.id]
+    );
+    if (result.rowCount === 0) {
+      console.log('Yogurt type already exists:', name);
+      return res.status(400).json({ error: 'Yogurt type already exists' });
+    }
+    console.log('Yogurt type added by:', req.user.email, 'Name:', name);
+    res.status(201).json({ id: result.rows[0].id, message: 'Yogurt type added' });
+  } catch (err) {
+    console.error('Add yogurt type error:', err);
+    res.status(500).json({ error: 'Failed to add yogurt type' });
+  }
+});
+
+// Fetch Yogurt Types (Seller)
+app.get('/yogurt_types', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'seller') {
+    console.log('Seller access denied for:', req.user.email, 'on', req.path);
+    return res.status(403).json({ error: 'Seller access required' });
+  }
+  try {
+    const result = await pool.query('SELECT id, name FROM yogurt_types');
+    console.log('Yogurt types fetched for:', req.user.email, 'Count:', result.rows.length);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Fetch yogurt types error:', err);
+    res.status(500).json({ error: 'Failed to fetch yogurt types' });
+  }
+});
+
+// Fetch Daily Totals (Seller)
+app.get('/daily_totals', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'seller') {
+    console.log('Seller access denied for:', req.user.email, 'on', req.path);
+    return res.status(403).json({ error: 'Seller access required' });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT yt.name, SUM(r.liters) as total_liters, SUM(r.amount_sold) as total_amount 
+       FROM records r 
+       JOIN yogurt_types yt ON r.yogurt_type_id = yt.id 
+       WHERE r.user_id = $1 AND DATE(r.created_at) = CURRENT_DATE 
+       GROUP BY yt.name`,
+      [req.user.id]
+    );
+    console.log('Daily totals fetched for:', req.user.email, 'Count:', result.rows.length);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Fetch daily totals error:', err);
+    res.status(500).json({ error: 'Failed to fetch daily totals' });
+  }
+});
+
+// Fetch Seller Summary
+app.get('/seller_summary', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'seller') {
+    console.log('Seller access denied for:', req.user.email, 'on', req.path);
+    return res.status(403).json({ error: 'Seller access required' });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT SUM(liters) as total_liters, SUM(amount_sold) as total_revenue 
+       FROM records 
+       WHERE user_id = $1`,
+      [req.user.id]
+    );
+    console.log('Seller summary fetched for:', req.user.email);
+    res.json({
+      total_liters: result.rows[0].total_liters || 0,
+      total_revenue: result.rows[0].total_revenue || 0
+    });
+  } catch (err) {
+    console.error('Fetch seller summary error:', err);
+    res.status(500).json({ error: 'Failed to fetch summary' });
+  }
+});
+
 // Messages (for AdminDashboard)
 app.post('/messages', authenticateToken, async (req, res) => {
   const { user_id, message } = req.body;
@@ -217,11 +312,11 @@ app.post('/messages', authenticateToken, async (req, res) => {
   }
   try {
     const result = await pool.query(
-      'INSERT INTO messages (user_id, message, created_at) VALUES ($1, $2, NOW()) RETURNING id',
+      'INSERT INTO messages (user_id, message, created_at) VALUES ($1, $2, NOW()) RETURNING id, user_id, message, created_at',
       [user_id, message]
     );
     console.log('Message sent by:', req.user.email, 'to user:', user_id);
-    res.status(201).json({ id: result.rows[0].id, message: 'Message sent' });
+    res.status(201).json({ id: result.rows[0].id, message: 'Message sent', data: result.rows[0] });
   } catch (err) {
     console.error('Send message error:', err);
     res.status(500).json({ error: 'Failed to send message' });
@@ -273,14 +368,18 @@ app.post('/users', authenticateToken, async (req, res) => {
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (email, password, name, role) VALUES ($1, $2, $3, $4) RETURNING id',
+      'INSERT INTO users (email, password, name, role) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING RETURNING id',
       [email.toLowerCase(), hashedPassword, name, role]
     );
+    if (result.rowCount === 0) {
+      console.log('User already exists:', email);
+      return res.status(400).json({ error: 'User already exists' });
+    }
     console.log('User added by admin:', email);
     res.status(201).json({ id: result.rows[0].id });
   } catch (err) {
     console.error('Add user error:', err);
-    res.status(400).json({ error: 'Failed to add user' });
+    res.status(500).json({ error: 'Failed to add user' });
   }
 });
 
@@ -291,7 +390,7 @@ app.delete('/users/:id', authenticateToken, async (req, res) => {
   }
   const { id } = req.params;
   try {
-    const result = await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING *', [id]);
     if (result.rowCount === 0) {
       console.log('User not found for deletion:', id);
       return res.status(404).json({ error: 'User not found' });
@@ -353,4 +452,5 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
-app.listen(process.env.PORT || 3000, () => console.log('Server running on port', process.env.PORT || 3000));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Server running on port', PORT));
