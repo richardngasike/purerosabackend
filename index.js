@@ -5,7 +5,10 @@ const bcrypt = require('bcrypt');
 const cors = require('cors');
 
 const app = express();
-app.use(cors({ origin: ['http://localhost:8081', 'https://purerosa.web.app'], credentials: true }));
+app.use(cors({ 
+  origin: ['http://localhost:8081', 'https://purerosa.web.app', 'https://purerosamilk.netlify.app'], 
+  credentials: true 
+}));
 app.use(express.json());
 
 const pool = new Pool({
@@ -29,13 +32,16 @@ const authenticateToken = (req, res, next) => {
 // Register
 app.post('/register', async (req, res) => {
   const { email, password, name, role } = req.body;
+  if (!email || !password || !name || !role) {
+    return res.status(400).json({ error: 'All fields are required' });
+  }
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
       'INSERT INTO users (email, password, name, role) VALUES ($1, $2, $3, $4) RETURNING id',
       [email, hashedPassword, name, role]
     );
-    res.status(201).json({ message: 'User registered' });
+    res.status(201).json({ message: 'User registered', userId: result.rows[0].id });
   } catch (err) {
     res.status(400).json({ error: 'User already exists' });
   }
@@ -44,6 +50,9 @@ app.post('/register', async (req, res) => {
 // Login
 app.post('/login', async (req, res) => {
   const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
   try {
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (result.rows.length === 0) {
@@ -51,7 +60,7 @@ app.post('/login', async (req, res) => {
     }
     const user = result.rows[0];
     if (await bcrypt.compare(password, user.password)) {
-      const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+      const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
       res.json({ token, role: user.role });
     } else {
       res.status(401).json({ error: 'Invalid credentials' });
@@ -64,44 +73,122 @@ app.post('/login', async (req, res) => {
 // Refresh Token
 app.post('/refresh', async (req, res) => {
   const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'Token is required' });
   try {
     const decoded = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true });
     const result = await pool.query('SELECT role FROM users WHERE id = $1', [decoded.id]);
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
-    const newToken = jwt.sign({ id: decoded.id, email: decoded.email }, JWT_SECRET, { expiresIn: '1h' });
+    const newToken = jwt.sign({ id: decoded.id, email: decoded.email, role: decoded.role }, JWT_SECRET, { expiresIn: '1h' });
     res.json({ token: newToken, role: result.rows[0].role });
   } catch (err) {
     res.status(500).json({ error: 'Failed to refresh token' });
   }
 });
 
-// Records (for FarmerScreen, SellerScreen, AdminDashboard)
+// Submit Milk Production (Farmer)
+app.post('/records', authenticateToken, async (req, res) => {
+  const { liters, price_per_liter } = req.body;
+  if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0)) {
+    return res.status(400).json({ error: 'Invalid liters or price_per_liter' });
+  }
+  try {
+    const result = await pool.query(
+      'INSERT INTO records (user_id, liters, price_per_liter, created_at, role) VALUES ($1, $2, $3, NOW(), $4) RETURNING id',
+      [req.user.id, liters, price_per_liter || null, req.user.role]
+    );
+    res.status(201).json({ id: result.rows[0].id, message: 'Record submitted successfully' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to submit record' });
+  }
+});
+
+// Fetch Records (Farmer, Seller, Admin)
 app.get('/records', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM records WHERE user_id = $1', [req.user.id]);
+    let query = 'SELECT * FROM records WHERE user_id = $1';
+    const params = [req.user.id];
+    if (req.user.role === 'admin') {
+      query = 'SELECT * FROM records';
+      params.length = 0; // Clear params for admin to fetch all records
+    }
+    const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch records' });
   }
 });
 
+// Update Record (Farmer, Admin)
+app.put('/records/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { liters, price_per_liter } = req.body;
+  if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0)) {
+    return res.status(400).json({ error: 'Invalid liters or price_per_liter' });
+  }
+  try {
+    const result = await pool.query(
+      'UPDATE records SET liters = $1, price_per_liter = $2, updated_at = NOW() WHERE id = $3 AND user_id = $4 RETURNING *',
+      [liters, price_per_liter || null, id, req.user.id]
+    );
+    if (result.rowCount === 0) {
+      if (req.user.role === 'admin') {
+        const adminResult = await pool.query(
+          'UPDATE records SET liters = $1, price_per_liter = $2, updated_at = NOW() WHERE id = $3 RETURNING *',
+          [liters, price_per_liter || null, id]
+        );
+        if (adminResult.rowCount === 0) return res.status(404).json({ error: 'Record not found' });
+        return res.json(adminResult.rows[0]);
+      }
+      return res.status(404).json({ error: 'Record not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update record' });
+  }
+});
+
+// Delete Record (Admin)
+app.delete('/records/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+  const { id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM records WHERE id = $1', [id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Record not found' });
+    res.status(200).json({ message: 'Record deleted' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete record' });
+  }
+});
+
 // Messages (for AdminDashboard)
 app.post('/messages', authenticateToken, async (req, res) => {
   const { user_id, message } = req.body;
+  if (!user_id || !message) return res.status(400).json({ error: 'User ID and message are required' });
   try {
     const result = await pool.query(
-      'INSERT INTO messages (user_id, message) VALUES ($1, $2) RETURNING id',
+      'INSERT INTO messages (user_id, message, created_at) VALUES ($1, $2, NOW()) RETURNING id',
       [user_id, message]
     );
-    res.status(201).json({ id: result.rows[0].id });
+    res.status(201).json({ id: result.rows[0].id, message: 'Message sent' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to send message' });
   }
 });
 
-// Admin Endpoints (for AdminDashboard)
+// Fetch Messages (Admin)
+app.get('/messages', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+  try {
+    const result = await pool.query('SELECT * FROM messages ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// Admin Endpoints
 app.get('/users', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
   try {
@@ -115,6 +202,9 @@ app.get('/users', authenticateToken, async (req, res) => {
 app.post('/users', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
   const { email, password, name, role } = req.body;
+  if (!email || !password || !name || !role) {
+    return res.status(400).json({ error: 'All fields are required' });
+  }
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
@@ -139,23 +229,11 @@ app.delete('/users/:id', authenticateToken, async (req, res) => {
   }
 });
 
-app.delete('/records/:id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
-  const { id } = req.params;
-  try {
-    const result = await pool.query('DELETE FROM records WHERE id = $1', [id]);
-    if (result.rowCount === 0) return res.status(404).json({ error: 'Record not found' });
-    res.status(200).json({ message: 'Record deleted' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to delete record' });
-  }
-});
-
 app.get('/analytics', authenticateToken, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
   try {
     const farmerResult = await pool.query(
-      'SELECT SUM(liters) as total_liters, SUM(liters * price_per_liter) as total_revenue FROM records WHERE role = $1',
+      'SELECT SUM(liters) as total_liters, SUM(liters * COALESCE(price_per_liter, 0)) as total_revenue FROM records WHERE role = $1',
       ['farmer']
     );
     const sellerResult = await pool.query(
@@ -177,6 +255,10 @@ app.get('/analytics', authenticateToken, async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 3000, () => console.log('Server running'));
+// Error Handling Middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something went wrong!' });
+});
 
-
+app.listen(process.env.PORT || 3000, () => console.log('Server running on port', process.env.PORT || 3000));
