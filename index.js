@@ -112,19 +112,39 @@ app.post('/refresh', async (req, res) => {
   }
 });
 
-// Submit Sales Record (Seller)
+// Submit Sales Record (Farmer and Seller)
 app.post('/records', authenticateToken, async (req, res) => {
   const { liters, price_per_liter, yogurt_type_id, amount_sold } = req.body;
-  if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0) || !yogurt_type_id || !amount_sold || amount_sold < 0) {
-    console.log('Invalid data in /records:', req.body);
-    return res.status(400).json({ error: 'Invalid liters, price_per_liter, yogurt_type_id, or amount_sold' });
+
+  // Validation based on user role
+  if (req.user.role === 'farmer') {
+    if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0)) {
+      console.log('Invalid data for farmer in /records:', req.body);
+      return res.status(400).json({ error: 'Invalid liters or price_per_liter' });
+    }
+  } else if (req.user.role === 'seller') {
+    if (!liters || liters <= 0 || !yogurt_type_id || !amount_sold || amount_sold < 0) {
+      console.log('Invalid data for seller in /records:', req.body);
+      return res.status(400).json({ error: 'Invalid liters, yogurt_type_id, or amount_sold' });
+    }
+  } else {
+    console.log('Invalid role for /records:', req.user.role);
+    return res.status(403).json({ error: 'Invalid user role' });
   }
+
   try {
     const result = await pool.query(
       'INSERT INTO records (user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role) VALUES ($1, $2, $3, $4, $5, NOW(), $6) RETURNING id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at',
-      [req.user.id, liters, price_per_liter, yogurt_type_id, amount_sold, req.user.role]
+      [
+        req.user.id,
+        liters,
+        price_per_liter || null,
+        yogurt_type_id || null,
+        amount_sold || null,
+        req.user.role
+      ]
     );
-    console.log('Record submitted by:', req.user.email, 'Data:', result.rows[0]);
+    console.log('Record submitted by:', req.user.email, 'Role:', req.user.role, 'Data:', result.rows[0]);
     res.status(201).json({
       id: result.rows[0].id,
       message: 'Record submitted successfully',
@@ -136,7 +156,7 @@ app.post('/records', authenticateToken, async (req, res) => {
   }
 });
 
-// Fetch Records (Seller, Admin)
+// Fetch Records (Farmer, Seller, Admin)
 app.get('/records', authenticateToken, async (req, res) => {
   try {
     let query = 'SELECT id, user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role FROM records WHERE user_id = $1';
@@ -154,24 +174,50 @@ app.get('/records', authenticateToken, async (req, res) => {
   }
 });
 
-// Update Record (Seller, Admin)
+// Update Record (Farmer, Seller, Admin)
 app.put('/records/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { liters, price_per_liter, yogurt_type_id, amount_sold } = req.body;
-  if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0) || !yogurt_type_id || !amount_sold || amount_sold < 0) {
-    console.log('Invalid data in /records update:', req.body);
-    return res.status(400).json({ error: 'Invalid liters, price_per_liter, yogurt_type_id, or amount_sold' });
+
+  // Validation based on user role
+  if (req.user.role === 'farmer') {
+    if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0)) {
+      console.log('Invalid data for farmer in /records update:', req.body);
+      return res.status(400).json({ error: 'Invalid liters or price_per_liter' });
+    }
+  } else if (req.user.role === 'seller') {
+    if (!liters || liters <= 0 || !yogurt_type_id || !amount_sold || amount_sold < 0) {
+      console.log('Invalid data for seller in /records update:', req.body);
+      return res.status(400).json({ error: 'Invalid liters, yogurt_type_id, or amount_sold' });
+    }
+  } else if (req.user.role !== 'admin') {
+    console.log('Invalid role for /records update:', req.user.role);
+    return res.status(403).json({ error: 'Invalid user role' });
   }
+
   try {
     const result = await pool.query(
       'UPDATE records SET liters = $1, price_per_liter = $2, yogurt_type_id = $3, amount_sold = $4, updated_at = NOW() WHERE id = $5 AND user_id = $6 RETURNING *',
-      [liters, price_per_liter, yogurt_type_id, amount_sold, id, req.user.id]
+      [
+        liters,
+        price_per_liter || null,
+        yogurt_type_id || null,
+        amount_sold || null,
+        id,
+        req.user.id
+      ]
     );
     if (result.rowCount === 0) {
       if (req.user.role === 'admin') {
         const adminResult = await pool.query(
           'UPDATE records SET liters = $1, price_per_liter = $2, yogurt_type_id = $3, amount_sold = $4, updated_at = NOW() WHERE id = $5 RETURNING *',
-          [liters, price_per_liter, yogurt_type_id, amount_sold, id]
+          [
+            liters,
+            price_per_liter || null,
+            yogurt_type_id || null,
+            amount_sold || null,
+            id
+          ]
         );
         if (adminResult.rowCount === 0) {
           console.log('Record not found for admin update:', id);
@@ -303,7 +349,7 @@ app.get('/seller_summary', authenticateToken, async (req, res) => {
   }
 });
 
-// Messages (for AdminDashboard and Seller)
+// Messages (for AdminDashboard and Seller/Farmer)
 app.post('/messages', authenticateToken, async (req, res) => {
   const { user_id, message } = req.body;
   if (!user_id || !message) {
@@ -323,12 +369,12 @@ app.post('/messages', authenticateToken, async (req, res) => {
   }
 });
 
-// Fetch Messages (Admin and Seller)
+// Fetch Messages (Admin, Seller, Farmer)
 app.get('/messages', authenticateToken, async (req, res) => {
   try {
     let query = 'SELECT id, user_id, message, created_at FROM messages';
     const params = [];
-    if (req.user.role === 'seller') {
+    if (req.user.role === 'seller' || req.user.role === 'farmer') {
       query += ' WHERE user_id = $1';
       params.push(req.user.id);
     }
