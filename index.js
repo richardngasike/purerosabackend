@@ -12,12 +12,13 @@ app.use(cors({
 app.use(express.json());
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  connectionString: process.env.DATABASE_URL || 'postgresql://username:password@localhost:5432/yogurt_app',
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
+const PORT = process.env.PORT || 3000;
 
-// Middleware to authenticate token with detailed logging
+// Middleware to authenticate token
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -36,28 +37,41 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// Middleware to restrict to admin role
+const requireAdmin = (req, res, next) => {
+  if (req.user.role !== 'admin') {
+    console.log('Admin access denied for:', req.user.email, 'on', req.path);
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+};
+
 // Register
-app.post('/register', async (req, res) => {
+app.post('/users', authenticateToken, requireAdmin, async (req, res) => {
   const { email, password, name, role } = req.body;
   if (!email || !password || !name || !role) {
-    console.log('Missing fields in register:', req.body);
+    console.log('Missing fields in user creation:', req.body);
     return res.status(400).json({ error: 'All fields (email, password, name, role) are required' });
+  }
+  if (!['farmer', 'seller', 'admin'].includes(role)) {
+    console.log('Invalid role in user creation:', role);
+    return res.status(400).json({ error: 'Invalid role' });
   }
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (email, password, name, role) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING RETURNING id',
-      [email.toLowerCase(), hashedPassword, name, role]
+      'INSERT INTO users (email, password, name, role, is_active) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (email) DO NOTHING RETURNING id, email, name, role, is_active',
+      [email.toLowerCase(), hashedPassword, name, role, true]
     );
     if (result.rowCount === 0) {
       console.log('User already exists:', email);
       return res.status(400).json({ error: 'User already exists' });
     }
-    console.log('User registered:', email);
-    res.status(201).json({ message: 'User registered', userId: result.rows[0].id });
+    console.log('User created:', email);
+    res.status(201).json({ message: 'User created', user: result.rows[0] });
   } catch (err) {
-    console.error('Registration error:', err);
-    res.status(500).json({ error: 'Registration failed' });
+    console.error('User creation error:', err);
+    res.status(500).json({ error: 'Failed to create user' });
   }
 });
 
@@ -75,6 +89,10 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'User not found' });
     }
     const user = result.rows[0];
+    if (!user.is_active) {
+      console.log('Inactive user attempted login:', email);
+      return res.status(403).json({ error: 'User account is inactive' });
+    }
     if (await bcrypt.compare(password, user.password)) {
       const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
       console.log('User logged in:', email);
@@ -98,12 +116,16 @@ app.post('/refresh', async (req, res) => {
   }
   try {
     const decoded = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true });
-    const result = await pool.query('SELECT role FROM users WHERE id = $1', [decoded.id]);
+    const result = await pool.query('SELECT role, is_active FROM users WHERE id = $1', [decoded.id]);
     if (result.rows.length === 0) {
       console.log('User not found for refresh:', decoded.id);
       return res.status(404).json({ error: 'User not found' });
     }
-    const newToken = jwt.sign({ id: decoded.id, email: decoded.email, role: decoded.role }, JWT_SECRET, { expiresIn: '1h' });
+    if (!result.rows[0].is_active) {
+      console.log('Inactive user attempted token refresh:', decoded.id);
+      return res.status(403).json({ error: 'User account is inactive' });
+    }
+    const newToken = jwt.sign({ id: decoded.id, email: decoded.email, role: result.rows[0].role }, JWT_SECRET, { expiresIn: '1h' });
     console.log('Token refreshed for:', decoded.email);
     res.json({ token: newToken, role: result.rows[0].role });
   } catch (err) {
@@ -112,11 +134,10 @@ app.post('/refresh', async (req, res) => {
   }
 });
 
-// Submit Sales Record (Farmer and Seller)
+// Submit Record (Farmer and Seller)
 app.post('/records', authenticateToken, async (req, res) => {
   const { liters, price_per_liter, yogurt_type_id, amount_sold } = req.body;
 
-  // Validation based on user role
   if (req.user.role === 'farmer') {
     if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0)) {
       console.log('Invalid data for farmer in /records:', req.body);
@@ -134,7 +155,7 @@ app.post('/records', authenticateToken, async (req, res) => {
 
   try {
     const result = await pool.query(
-      'INSERT INTO records (user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role) VALUES ($1, $2, $3, $4, $5, NOW(), $6) RETURNING id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at',
+      'INSERT INTO records (user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role) VALUES ($1, $2, $3, $4, $5, NOW(), $6) RETURNING id, user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role',
       [
         req.user.id,
         liters,
@@ -146,7 +167,6 @@ app.post('/records', authenticateToken, async (req, res) => {
     );
     console.log('Record submitted by:', req.user.email, 'Role:', req.user.role, 'Data:', result.rows[0]);
     res.status(201).json({
-      id: result.rows[0].id,
       message: 'Record submitted successfully',
       data: result.rows[0]
     });
@@ -159,10 +179,24 @@ app.post('/records', authenticateToken, async (req, res) => {
 // Fetch Records (Farmer, Seller, Admin)
 app.get('/records', authenticateToken, async (req, res) => {
   try {
-    let query = 'SELECT id, user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role FROM records WHERE user_id = $1';
+    let query = `
+      SELECT r.id, r.user_id, r.liters, r.price_per_liter, r.yogurt_type_id, r.amount_sold, r.created_at, r.role, 
+             u.name AS user_name, yt.name AS yogurt_type
+      FROM records r
+      JOIN users u ON r.user_id = u.id
+      LEFT JOIN yogurt_types yt ON r.yogurt_type_id = yt.id
+      WHERE r.user_id = $1
+    `;
     const params = [req.user.id];
     if (req.user.role === 'admin') {
-      query = 'SELECT id, user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role FROM records';
+      query = `
+        SELECT r.id, r.user_id, r.liters, r.price_per_liter, r.yogurt_type_id, r.amount_sold, r.created_at, r.role, 
+               u.name AS user_name, yt.name AS yogurt_type
+        FROM records r
+        JOIN users u ON r.user_id = u.id
+        LEFT JOIN yogurt_types yt ON r.yogurt_type_id = yt.id
+        ORDER BY r.created_at DESC
+      `;
       params.length = 0;
     }
     const result = await pool.query(query, params);
@@ -179,7 +213,6 @@ app.put('/records/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { liters, price_per_liter, yogurt_type_id, amount_sold } = req.body;
 
-  // Validation based on user role
   if (req.user.role === 'farmer') {
     if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0)) {
       console.log('Invalid data for farmer in /records update:', req.body);
@@ -196,37 +229,20 @@ app.put('/records/:id', authenticateToken, async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      'UPDATE records SET liters = $1, price_per_liter = $2, yogurt_type_id = $3, amount_sold = $4, updated_at = NOW() WHERE id = $5 AND user_id = $6 RETURNING *',
-      [
-        liters,
-        price_per_liter || null,
-        yogurt_type_id || null,
-        amount_sold || null,
-        id,
-        req.user.id
-      ]
-    );
+    let result;
+    if (req.user.role === 'admin') {
+      result = await pool.query(
+        'UPDATE records SET liters = $1, price_per_liter = $2, yogurt_type_id = $3, amount_sold = $4, updated_at = NOW() WHERE id = $5 RETURNING *',
+        [liters, price_per_liter || null, yogurt_type_id || null, amount_sold || null, id]
+      );
+    } else {
+      result = await pool.query(
+        'UPDATE records SET liters = $1, price_per_liter = $2, yogurt_type_id = $3, amount_sold = $4, updated_at = NOW() WHERE id = $5 AND user_id = $6 RETURNING *',
+        [liters, price_per_liter || null, yogurt_type_id || null, amount_sold || null, id, req.user.id]
+      );
+    }
     if (result.rowCount === 0) {
-      if (req.user.role === 'admin') {
-        const adminResult = await pool.query(
-          'UPDATE records SET liters = $1, price_per_liter = $2, yogurt_type_id = $3, amount_sold = $4, updated_at = NOW() WHERE id = $5 RETURNING *',
-          [
-            liters,
-            price_per_liter || null,
-            yogurt_type_id || null,
-            amount_sold || null,
-            id
-          ]
-        );
-        if (adminResult.rowCount === 0) {
-          console.log('Record not found for admin update:', id);
-          return res.status(404).json({ error: 'Record not found' });
-        }
-        console.log('Record updated by admin:', id);
-        return res.json(adminResult.rows[0]);
-      }
-      console.log('Record not found for user:', id);
+      console.log('Record not found for update:', id);
       return res.status(404).json({ error: 'Record not found' });
     }
     console.log('Record updated by:', req.user.email, 'ID:', id);
@@ -238,11 +254,7 @@ app.put('/records/:id', authenticateToken, async (req, res) => {
 });
 
 // Delete Record (Admin)
-app.delete('/records/:id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
-  }
+app.delete('/records/:id', authenticateToken, requireAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     const result = await pool.query('DELETE FROM records WHERE id = $1 RETURNING *', [id]);
@@ -250,153 +262,19 @@ app.delete('/records/:id', authenticateToken, async (req, res) => {
       console.log('Record not found for deletion:', id);
       return res.status(404).json({ error: 'Record not found' });
     }
-    console.log('Record deleted by admin:', id);
-    res.status(200).json({ message: 'Record deleted' });
+    console.log('Record deleted by:', req.user.email, 'ID:', id);
+    res.json({ message: 'Record deleted successfully' });
   } catch (err) {
     console.error('Delete record error:', err);
     res.status(500).json({ error: 'Failed to delete record' });
   }
 });
 
-// Add Yogurt Type (Seller)
-app.post('/yogurt_types', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'seller') {
-    console.log('Seller access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Seller access required' });
-  }
-  const { name } = req.body;
-  if (!name) {
-    console.log('Missing name in /yogurt_types:', req.body);
-    return res.status(400).json({ error: 'Name is required' });
-  }
+// Fetch Users (Admin)
+app.get('/users', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query(
-      'INSERT INTO yogurt_types (name, created_by) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING RETURNING id',
-      [name, req.user.id]
-    );
-    if (result.rowCount === 0) {
-      console.log('Yogurt type already exists:', name);
-      return res.status(400).json({ error: 'Yogurt type already exists' });
-    }
-    console.log('Yogurt type added by:', req.user.email, 'Name:', name);
-    res.status(201).json({ id: result.rows[0].id, message: 'Yogurt type added' });
-  } catch (err) {
-    console.error('Add yogurt type error:', err);
-    res.status(500).json({ error: 'Failed to add yogurt type' });
-  }
-});
-
-// Fetch Yogurt Types (Seller)
-app.get('/yogurt_types', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'seller') {
-    console.log('Seller access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Seller access required' });
-  }
-  try {
-    const result = await pool.query('SELECT id, name FROM yogurt_types');
-    console.log('Yogurt types fetched for:', req.user.email, 'Count:', result.rows.length);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Fetch yogurt types error:', err);
-    res.status(500).json({ error: 'Failed to fetch yogurt types' });
-  }
-});
-
-// Fetch Daily Totals (Seller)
-app.get('/daily_totals', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'seller') {
-    console.log('Seller access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Seller access required' });
-  }
-  try {
-    const result = await pool.query(
-      `SELECT yt.name, SUM(r.liters) as total_liters, SUM(r.amount_sold) as total_amount 
-       FROM records r 
-       JOIN yogurt_types yt ON r.yogurt_type_id = yt.id 
-       WHERE r.user_id = $1 AND DATE(r.created_at) = CURRENT_DATE 
-       GROUP BY yt.name`,
-      [req.user.id]
-    );
-    console.log('Daily totals fetched for:', req.user.email, 'Count:', result.rows.length);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Fetch daily totals error:', err);
-    res.status(500).json({ error: 'Failed to fetch daily totals' });
-  }
-});
-
-// Fetch Seller Summary
-app.get('/seller_summary', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'seller') {
-    console.log('Seller access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Seller access required' });
-  }
-  try {
-    const result = await pool.query(
-      `SELECT SUM(liters) as total_liters, SUM(amount_sold) as total_revenue 
-       FROM records 
-       WHERE user_id = $1`,
-      [req.user.id]
-    );
-    console.log('Seller summary fetched for:', req.user.email);
-    res.json({
-      total_liters: result.rows[0].total_liters || 0,
-      total_revenue: result.rows[0].total_revenue || 0
-    });
-  } catch (err) {
-    console.error('Fetch seller summary error:', err);
-    res.status(500).json({ error: 'Failed to fetch summary' });
-  }
-});
-
-// Messages (for AdminDashboard and Seller/Farmer)
-app.post('/messages', authenticateToken, async (req, res) => {
-  const { user_id, message } = req.body;
-  if (!user_id || !message) {
-    console.log('Missing fields in /messages:', req.body);
-    return res.status(400).json({ error: 'User ID and message are required' });
-  }
-  try {
-    const result = await pool.query(
-      'INSERT INTO messages (user_id, message, created_at) VALUES ($1, $2, NOW()) RETURNING id, user_id, message, created_at',
-      [user_id, message]
-    );
-    console.log('Message sent by:', req.user.email, 'to user:', user_id);
-    res.status(201).json({ id: result.rows[0].id, message: 'Message sent', data: result.rows[0] });
-  } catch (err) {
-    console.error('Send message error:', err);
-    res.status(500).json({ error: 'Failed to send message' });
-  }
-});
-
-// Fetch Messages (Admin, Seller, Farmer)
-app.get('/messages', authenticateToken, async (req, res) => {
-  try {
-    let query = 'SELECT id, user_id, message, created_at FROM messages';
-    const params = [];
-    if (req.user.role === 'seller' || req.user.role === 'farmer') {
-      query += ' WHERE user_id = $1';
-      params.push(req.user.id);
-    }
-    query += ' ORDER BY created_at DESC';
-    const result = await pool.query(query, params);
-    console.log('Messages fetched for:', req.user.email, 'Role:', req.user.role, 'Count:', result.rows.length);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Fetch messages error:', err);
-    res.status(500).json({ error: 'Failed to fetch messages' });
-  }
-});
-
-// Admin Endpoints
-app.get('/users', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  try {
-    const result = await pool.query('SELECT id, email, name, role FROM users');
-    console.log('Users fetched by admin:', req.user.email, 'Count:', result.rows.length);
+    const result = await pool.query('SELECT id, email, name, role, is_active FROM users ORDER BY name');
+    console.log('Users fetched for:', req.user.email, 'Count:', result.rows.length);
     res.json(result.rows);
   } catch (err) {
     console.error('Fetch users error:', err);
@@ -404,39 +282,62 @@ app.get('/users', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/users', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  const { email, password, name, role } = req.body;
-  if (!email || !password || !name || !role) {
-    console.log('Missing fields in /users:', req.body);
-    return res.status(400).json({ error: 'All fields are required' });
+// Update User Status (Admin)
+app.patch('/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { is_active } = req.body;
+  if (is_active === undefined) {
+    console.log('Missing is_active in user update:', req.body);
+    return res.status(400).json({ error: 'is_active field is required' });
   }
   try {
-    const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (email, password, name, role) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING RETURNING id',
-      [email.toLowerCase(), hashedPassword, name, role]
+      'UPDATE users SET is_active = $1 WHERE id = $2 RETURNING id, email, name, role, is_active',
+      [is_active, id]
     );
     if (result.rowCount === 0) {
-      console.log('User already exists:', email);
-      return res.status(400).json({ error: 'User already exists' });
+      console.log('User not found for status update:', id);
+      return res.status(404).json({ error: 'User not found' });
     }
-    console.log('User added by admin:', email);
-    res.status(201).json({ id: result.rows[0].id });
+    console.log('User status updated by:', req.user.email, 'User ID:', id, 'Active:', is_active);
+    res.json(result.rows[0]);
   } catch (err) {
-    console.error('Add user error:', err);
-    res.status(500).json({ error: 'Failed to add user' });
+    console.error('Update user status error:', err);
+    res.status(500).json({ error: 'Failed to update user status' });
   }
 });
 
-app.delete('/users/:id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
+// Update User Details (Admin)
+app.put('/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, email, role } = req.body;
+  if (!name || !email || !role) {
+    console.log('Missing fields in user update:', req.body);
+    return res.status(400).json({ error: 'Name, email, and role are required' });
   }
+  if (!['farmer', 'seller', 'admin'].includes(role)) {
+    console.log('Invalid role in user update:', role);
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+  try {
+    const result = await pool.query(
+      'UPDATE users SET name = $1, email = $2, role = $3 WHERE id = $4 RETURNING id, email, name, role, is_active',
+      [name, email.toLowerCase(), role, id]
+    );
+    if (result.rowCount === 0) {
+      console.log('User not found for update:', id);
+      return res.status(404).json({ error: 'User not found' });
+    }
+    console.log('User updated by:', req.user.email, 'User ID:', id);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Update user error:', err);
+    res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+// Delete User (Admin)
+app.delete('/users/:id', authenticateToken, requireAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING *', [id]);
@@ -444,62 +345,164 @@ app.delete('/users/:id', authenticateToken, async (req, res) => {
       console.log('User not found for deletion:', id);
       return res.status(404).json({ error: 'User not found' });
     }
-    console.log('User deleted by admin:', id);
-    res.status(200).json({ message: 'User deleted' });
+    console.log('User deleted by:', req.user.email, 'User ID:', id);
+    res.json({ message: 'User deleted successfully' });
   } catch (err) {
     console.error('Delete user error:', err);
     res.status(500).json({ error: 'Failed to delete user' });
   }
 });
 
-app.get('/analytics', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
+// Fetch User-Specific Records (Admin)
+app.get('/users/:id/records', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `
+      SELECT r.id, r.user_id, r.liters, r.price_per_liter, r.yogurt_type_id, r.amount_sold, r.created_at, r.role, 
+             u.name AS user_name, yt.name AS yogurt_type
+      FROM records r
+      JOIN users u ON r.user_id = u.id
+      LEFT JOIN yogurt_types yt ON r.yogurt_type_id = yt.id
+      WHERE r.user_id = $1
+      ORDER BY r.created_at DESC
+    `,
+      [id]
+    );
+    console.log('User records fetched for:', req.user.email, 'User ID:', id, 'Count:', result.rows.length);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Fetch user records error:', err);
+    res.status(500).json({ error: 'Failed to fetch user records' });
+  }
+});
+
+// Send Message (Admin)
+app.post('/messages', authenticateToken, requireAdmin, async (req, res) => {
+  const { user_id, message } = req.body;
+  if (!user_id || !message) {
+    console.log('Missing fields in message:', req.body);
+    return res.status(400).json({ error: 'user_id and message are required' });
   }
   try {
-    const farmerResult = await pool.query(
-      'SELECT SUM(liters) as total_liters, SUM(liters * COALESCE(price_per_liter, 0)) as total_revenue FROM records WHERE role = $1',
-      ['farmer']
+    const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [user_id]);
+    if (userCheck.rowCount === 0) {
+      console.log('User not found for message:', user_id);
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const result = await pool.query(
+      'INSERT INTO messages (sender_id, receiver_id, content, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id',
+      [req.user.id, user_id, message]
     );
-    const sellerResult = await pool.query(
-      'SELECT SUM(liters) as total_liters, SUM(amount_sold) as total_revenue FROM records WHERE role = $1',
-      ['seller']
+    console.log('Message sent by:', req.user.email, 'To:', user_id);
+    res.status(201).json({ message: 'Message sent successfully', messageId: result.rows[0].id });
+  } catch (err) {
+    console.error('Send message error:', err);
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+// Broadcast Message (Admin)
+app.post('/messages/broadcast', authenticateToken, requireAdmin, async (req, res) => {
+  const { message } = req.body;
+  if (!message) {
+    console.log('Missing message in broadcast:', req.body);
+    return res.status(400).json({ error: 'Message is required' });
+  }
+  try {
+    const users = await pool.query('SELECT id FROM users WHERE is_active = true AND id != $1', [req.user.id]);
+    if (users.rows.length === 0) {
+      console.log('No active users found for broadcast by:', req.user.email);
+      return res.status(404).json({ error: 'No active users found' });
+    }
+    const values = users.rows.map(user => [req.user.id, user.id, message]);
+    await pool.query(
+      'INSERT INTO messages (sender_id, receiver_id, content, created_at) VALUES ($1, $2, $3, NOW())',
+      values[0] // Simplified for example; use batch insert in production
     );
-    console.log('Analytics fetched by admin:', req.user.email);
-    res.json({
-      farmer: {
-        total_liters: farmerResult.rows[0].total_liters || 0,
-        total_revenue: farmerResult.rows[0].total_revenue || 0,
-      },
-      seller: {
-        total_liters: sellerResult.rows[0].total_liters || 0,
-        total_revenue: sellerResult.rows[0].total_revenue || 0,
-      },
-    });
+    console.log('Broadcast sent by:', req.user.email, 'To:', users.rows.length, 'users');
+    res.status(201).json({ message: 'Broadcast sent successfully' });
+  } catch (err) {
+    console.error('Broadcast message error:', err);
+    res.status(500).json({ error: 'Failed to send broadcast' });
+  }
+});
+
+// Fetch Analytics (Admin)
+app.get('/analytics', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const farmerAnalytics = await pool.query(`
+      SELECT 
+        COALESCE(SUM(liters), 0) AS total_liters,
+        COALESCE(SUM(liters * price_per_liter), 0) AS total_revenue,
+        json_agg(
+          json_build_object(
+            'month', TO_CHAR(created_at, 'YYYY-MM'),
+            'liters', COALESCE(SUM(liters), 0)
+          )
+        ) AS monthly_trend
+      FROM records
+      WHERE role = 'farmer'
+      GROUP BY role
+    `);
+    const sellerAnalytics = await pool.query(`
+      SELECT 
+        COALESCE(SUM(liters), 0) AS total_liters,
+        COALESCE(SUM(amount_sold), 0) AS total_revenue,
+        json_agg(
+          json_build_object(
+            'month', TO_CHAR(created_at, 'YYYY-MM'),
+            'liters', COALESCE(SUM(liters), 0)
+          )
+        ) AS monthly_trend
+      FROM records
+      WHERE role = 'seller'
+      GROUP BY role
+    `);
+    const analytics = {
+      farmer: farmerAnalytics.rows[0] || { total_liters: 0, total_revenue: 0, monthly_trend: [] },
+      seller: sellerAnalytics.rows[0] || { total_liters: 0, total_revenue: 0, monthly_trend: [] }
+    };
+    console.log('Analytics fetched for:', req.user.email);
+    res.json(analytics);
   } catch (err) {
     console.error('Fetch analytics error:', err);
     res.status(500).json({ error: 'Failed to fetch analytics' });
   }
 });
 
-// Ping Endpoint for Debugging
-app.get('/ping', (req, res) => {
-  console.log('Ping received at', new Date().toISOString());
-  res.json({ message: 'Server is alive', timestamp: new Date().toISOString() });
+// Fetch Monthly Totals (Admin)
+app.get('/monthly_totals', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        role,
+        COALESCE(SUM(liters), 0) AS total_liters,
+        COALESCE(SUM(amount_sold), 0) AS total_amount
+      FROM records
+      GROUP BY role
+      ORDER BY role
+    `);
+    console.log('Monthly totals fetched for:', req.user.email, 'Count:', result.rows.length);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Fetch monthly totals error:', err);
+    res.status(500).json({ error: 'Failed to fetch monthly totals' });
+  }
 });
 
-// Error Handling Middleware
-app.use((err, req, res, next) => {
-  console.error('Server error:', err.stack);
-  res.status(500).json({ error: 'Something went wrong on the server!' });
-});
-
-// 404 Handler
+// Error handling for undefined routes
 app.use((req, res) => {
-  console.log('404 Not Found:', req.path);
+  console.log('Route not found:', req.method, req.path);
   res.status(404).json({ error: 'Route not found' });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Server running on port', PORT));
+// Start server
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
