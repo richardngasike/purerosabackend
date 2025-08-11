@@ -303,7 +303,7 @@ app.get('/seller_summary', authenticateToken, async (req, res) => {
   }
 });
 
-// Messages (for AdminDashboard)
+// Messages (for AdminDashboard and Seller)
 app.post('/messages', authenticateToken, async (req, res) => {
   const { user_id, message } = req.body;
   if (!user_id || !message) {
@@ -323,15 +323,18 @@ app.post('/messages', authenticateToken, async (req, res) => {
   }
 });
 
-// Fetch Messages (Admin)
+// Fetch Messages (Admin and Seller)
 app.get('/messages', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
-  }
   try {
-    const result = await pool.query('SELECT * FROM messages ORDER BY created_at DESC');
-    console.log('Messages fetched by admin:', req.user.email, 'Count:', result.rows.length);
+    let query = 'SELECT id, user_id, message, created_at FROM messages';
+    const params = [];
+    if (req.user.role === 'seller') {
+      query += ' WHERE user_id = $1';
+      params.push(req.user.id);
+    }
+    query += ' ORDER BY created_at DESC';
+    const result = await pool.query(query, params);
+    console.log('Messages fetched for:', req.user.email, 'Role:', req.user.role, 'Count:', result.rows.length);
     res.json(result.rows);
   } catch (err) {
     console.error('Fetch messages error:', err);
