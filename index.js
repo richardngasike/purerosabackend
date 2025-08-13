@@ -1,505 +1,409 @@
 const express = require('express');
-const { Pool } = require('pg');
-const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
-const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const { Pool } = require('pg');
+const nodemailer = require('nodemailer');
+const router = express.Router();
 
-const app = express();
-app.use(cors({
-  origin: ['http://localhost:8081', 'https://purerosa.web.app', 'https://purerosamilk.netlify.app'],
-  credentials: true
-}));
-app.use(express.json());
-
+// Initialize PostgreSQL connection
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT || 5432,
 });
-const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
 
-// Middleware to authenticate token with detailed logging
-const authenticateToken = (req, res, next) => {
+// Configure nodemailer for sending emails
+const transporter = nodemailer.createTransport({
+  service: process.env.EMAIL_SERVICE || 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+// Middleware to validate request body
+const validateRequest = (req, res, requiredFields) => {
+  for (const field of requiredFields) {
+    if (!req.body[field]) {
+      return res.status(400).json({ success: false, error: `Missing required field: ${field}` });
+    }
+  }
+};
+
+// JWT middleware for authentication
+const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) {
-    console.log('Unauthorized: No token provided for', req.path);
-    return res.status(401).json({ error: 'Unauthorized: No token provided' });
+    return res.status(401).json({ success: false, error: 'No token provided' });
   }
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      console.log('Invalid token for', req.path, ':', err.message);
-      return res.status(403).json({ error: `Invalid token: ${err.message}` });
-    }
-    req.user = user;
-    console.log('Authenticated user:', user.email, 'for', req.path);
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
     next();
-  });
+  } catch (error) {
+    return res.status(401).json({ success: false, error: 'Invalid or expired token' });
+  }
 };
 
-// Register
-app.post('/register', async (req, res) => {
-  const { email, password, name, role } = req.body;
-  if (!email || !password || !name || !role) {
-    console.log('Missing fields in register:', req.body);
-    return res.status(400).json({ error: 'All fields (email, password, name, role) are required' });
+// Role-based middleware
+const restrictToRole = (roles) => (req, res, next) => {
+  if (!roles.includes(req.user.role)) {
+    return res.status(403).json({ success: false, error: 'Unauthorized for this role' });
   }
+  next();
+};
+
+// Register route
+router.post('/register', async (req, res) => {
   try {
+    const { email, password, role, name, phone } = req.body;
+    validateRequest(req, res, ['email', 'password', 'role', 'name', 'phone']);
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ success: false, error: 'Invalid email format' });
+    }
+    const validRoles = ['farmer', 'seller', 'admin'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ success: false, error: 'Invalid role' });
+    }
+    const phoneRegex = /^\+?\d{10,12}$/;
+    if (!phoneRegex.test(phone)) {
+      return res.status(400).json({ success: false, error: 'Invalid phone number' });
+    }
+    const existingUser = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (existingUser.rows.length > 0) {
+      return res.status(409).json({ success: false, error: 'Email already exists' });
+    }
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (email, password, name, role) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING RETURNING id',
-      [email.toLowerCase(), hashedPassword, name, role]
+      'INSERT INTO users (email, password, role, name, phone, created_at) VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING id, email, role, name, phone',
+      [email, hashedPassword, role, name, phone]
     );
-    if (result.rowCount === 0) {
-      console.log('User already exists:', email);
-      return res.status(400).json({ error: 'User already exists' });
-    }
-    console.log('User registered:', email);
-    res.status(201).json({ message: 'User registered', userId: result.rows[0].id });
-  } catch (err) {
-    console.error('Registration error:', err);
-    res.status(500).json({ error: 'Registration failed' });
+    const token = jwt.sign(
+      { id: result.rows[0].id, role: result.rows[0].role },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+    res.status(201).json({
+      success: true,
+      message: 'User registered successfully',
+      user: result.rows[0],
+      token,
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
-// Login
-app.post('/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    console.log('Missing credentials in login:', req.body);
-    return res.status(400).json({ error: 'Email and password are required' });
-  }
+// Login route
+router.post('/login', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+    const { email, password } = req.body;
+    validateRequest(req, res, ['email', 'password']);
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (result.rows.length === 0) {
-      console.log('User not found:', email);
-      return res.status(401).json({ error: 'User not found' });
+      return res.status(401).json({ success: false, error: 'Invalid credentials' });
     }
     const user = result.rows[0];
-    if (await bcrypt.compare(password, user.password)) {
-      const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
-      console.log('User logged in:', email);
-      res.json({ token, role: user.role });
-    } else {
-      console.log('Invalid credentials for:', email);
-      res.status(401).json({ error: 'Invalid credentials' });
+    const isValid = await bcrypt.compare(password, user.password);
+    if (!isValid) {
+      return res.status(401).json({ success: false, error: 'Invalid credentials' });
     }
-  } catch (err) {
-    console.error('Login error:', err);
-    res.status(500).json({ error: 'Login failed' });
+    const token = jwt.sign(
+      { id: user.id, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+    res.json({
+      success: true,
+      token,
+      user: { id: user.id, email: user.email, role: user.role, name: user.name, phone: user.phone },
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
-// Refresh Token
-app.post('/refresh', async (req, res) => {
-  const { token } = req.body;
-  if (!token) {
-    console.log('Missing token in refresh request');
-    return res.status(400).json({ error: 'Token is required' });
-  }
+// Reset password request route
+router.post('/reset-password', async (req, res) => {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true });
-    const result = await pool.query('SELECT role FROM users WHERE id = $1', [decoded.id]);
+    const { email } = req.body;
+    validateRequest(req, res, ['email']);
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (result.rows.length === 0) {
-      console.log('User not found for refresh:', decoded.id);
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
-    const newToken = jwt.sign({ id: decoded.id, email: decoded.email, role: decoded.role }, JWT_SECRET, { expiresIn: '1h' });
-    console.log('Token refreshed for:', decoded.email);
-    res.json({ token: newToken, role: result.rows[0].role });
-  } catch (err) {
-    console.error('Token refresh error:', err);
-    res.status(500).json({ error: `Failed to refresh token: ${err.message}` });
-  }
-});
-
-// Submit Sales Record (Farmer and Seller)
-app.post('/records', authenticateToken, async (req, res) => {
-  const { liters, price_per_liter, yogurt_type_id, amount_sold } = req.body;
-
-  // Validation based on user role
-  if (req.user.role === 'farmer') {
-    if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0)) {
-      console.log('Invalid data for farmer in /records:', req.body);
-      return res.status(400).json({ error: 'Invalid liters or price_per_liter' });
-    }
-  } else if (req.user.role === 'seller') {
-    if (!liters || liters <= 0 || !yogurt_type_id || !amount_sold || amount_sold < 0) {
-      console.log('Invalid data for seller in /records:', req.body);
-      return res.status(400).json({ error: 'Invalid liters, yogurt_type_id, or amount_sold' });
-    }
-  } else {
-    console.log('Invalid role for /records:', req.user.role);
-    return res.status(403).json({ error: 'Invalid user role' });
-  }
-
-  try {
-    const result = await pool.query(
-      'INSERT INTO records (user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role) VALUES ($1, $2, $3, $4, $5, NOW(), $6) RETURNING id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at',
-      [
-        req.user.id,
-        liters,
-        price_per_liter || null,
-        yogurt_type_id || null,
-        amount_sold || null,
-        req.user.role
-      ]
+    const resetToken = jwt.sign(
+      { id: result.rows[0].id, email },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
     );
-    console.log('Record submitted by:', req.user.email, 'Role:', req.user.role, 'Data:', result.rows[0]);
-    res.status(201).json({
-      id: result.rows[0].id,
-      message: 'Record submitted successfully',
-      data: result.rows[0]
+    await pool.query(
+      'INSERT INTO password_resets (user_id, token, expires_at) VALUES ($1, $2, NOW() + INTERVAL \'15 minutes\')',
+      [result.rows[0].id, resetToken]
+    );
+    const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
+    await transporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: 'PureRosaMilk Password Reset',
+      html: `
+        <p>You requested a password reset for your PureRosaMilk account.</p>
+        <p>Click <a href="${resetUrl}">here</a> to reset your password.</p>
+        <p>This link will expire in 15 minutes.</p>
+      `,
     });
-  } catch (err) {
-    console.error('Record submission error:', err);
-    res.status(500).json({ error: 'Failed to submit record' });
+    res.json({ success: true, message: 'Password reset link sent' });
+  } catch (error) {
+    console.error('Password reset error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
-// Fetch Records (Farmer, Seller, Admin)
-app.get('/records', authenticateToken, async (req, res) => {
+// Reset password confirmation route
+router.post('/reset-password/confirm', async (req, res) => {
   try {
-    let query = 'SELECT id, user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role FROM records WHERE user_id = $1';
-    const params = [req.user.id];
-    if (req.user.role === 'admin') {
-      query = 'SELECT id, user_id, liters, price_per_liter, yogurt_type_id, amount_sold, created_at, role FROM records';
-      params.length = 0;
+    const { token, newPassword } = req.body;
+    validateRequest(req, res, ['token', 'newPassword']);
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (error) {
+      return res.status(400).json({ success: false, error: 'Invalid or expired token' });
     }
-    const result = await pool.query(query, params);
-    console.log('Records fetched for:', req.user.email, 'Count:', result.rows.length);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Fetch records error:', err);
-    res.status(500).json({ error: 'Failed to fetch records' });
-  }
-});
-
-// Update Record (Farmer, Seller, Admin)
-app.put('/records/:id', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const { liters, price_per_liter, yogurt_type_id, amount_sold } = req.body;
-
-  // Validation based on user role
-  if (req.user.role === 'farmer') {
-    if (!liters || liters <= 0 || (price_per_liter && price_per_liter < 0)) {
-      console.log('Invalid data for farmer in /records update:', req.body);
-      return res.status(400).json({ error: 'Invalid liters or price_per_liter' });
-    }
-  } else if (req.user.role === 'seller') {
-    if (!liters || liters <= 0 || !yogurt_type_id || !amount_sold || amount_sold < 0) {
-      console.log('Invalid data for seller in /records update:', req.body);
-      return res.status(400).json({ error: 'Invalid liters, yogurt_type_id, or amount_sold' });
-    }
-  } else if (req.user.role !== 'admin') {
-    console.log('Invalid role for /records update:', req.user.role);
-    return res.status(403).json({ error: 'Invalid user role' });
-  }
-
-  try {
     const result = await pool.query(
-      'UPDATE records SET liters = $1, price_per_liter = $2, yogurt_type_id = $3, amount_sold = $4, updated_at = NOW() WHERE id = $5 AND user_id = $6 RETURNING *',
-      [
-        liters,
-        price_per_liter || null,
-        yogurt_type_id || null,
-        amount_sold || null,
-        id,
-        req.user.id
-      ]
+      'SELECT * FROM password_resets WHERE token = $1 AND expires_at > NOW()',
+      [token]
     );
-    if (result.rowCount === 0) {
+    if (result.rows.length === 0) {
+      return res.status(400).json({ success: false, error: 'Invalid or expired token' });
+    }
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE users SET password = $1 WHERE id = $2', [
+      hashedPassword,
+      decoded.id,
+    ]);
+    await pool.query('DELETE FROM password_resets WHERE token = $1', [token]);
+    res.json({ success: true, message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('Password reset confirmation error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Milk submissions route (Admin and Farmer)
+router.get(
+  '/api/milk/submissions',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      let query, params;
       if (req.user.role === 'admin') {
-        const adminResult = await pool.query(
-          'UPDATE records SET liters = $1, price_per_liter = $2, yogurt_type_id = $3, amount_sold = $4, updated_at = NOW() WHERE id = $5 RETURNING *',
-          [
-            liters,
-            price_per_liter || null,
-            yogurt_type_id || null,
-            amount_sold || null,
-            id
-          ]
-        );
-        if (adminResult.rowCount === 0) {
-          console.log('Record not found for admin update:', id);
-          return res.status(404).json({ error: 'Record not found' });
-        }
-        console.log('Record updated by admin:', id);
-        return res.json(adminResult.rows[0]);
+        query = `
+          SELECT ms.id, ms.litres, ms.price_per_litre, ms.submission_date, u.name
+          FROM milk_submissions ms
+          JOIN users u ON ms.farmer_id = u.id
+          WHERE u.role = 'farmer'
+          ORDER BY ms.submission_date DESC
+        `;
+        params = [];
+      } else if (req.user.role === 'farmer') {
+        query = `
+          SELECT ms.id, ms.litres, ms.price_per_litre, ms.submission_date
+          FROM milk_submissions ms
+          WHERE ms.farmer_id = $1
+          ORDER BY ms.submission_date DESC
+        `;
+        params = [req.user.id];
+      } else {
+        return res.status(403).json({ success: false, error: 'Unauthorized for this role' });
       }
-      console.log('Record not found for user:', id);
-      return res.status(404).json({ error: 'Record not found' });
+      const result = await pool.query(query, params);
+      res.json(result.rows);
+    } catch (error) {
+      console.error('Fetch submissions error:', error);
+      res.status(500).json({ success: false, error: 'Server error' });
     }
-    console.log('Record updated by:', req.user.email, 'ID:', id);
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('Update record error:', err);
-    res.status(500).json({ error: 'Failed to update record' });
   }
-});
+);
 
-// Delete Record (Admin)
-app.delete('/records/:id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  const { id } = req.params;
-  try {
-    const result = await pool.query('DELETE FROM records WHERE id = $1 RETURNING *', [id]);
-    if (result.rowCount === 0) {
-      console.log('Record not found for deletion:', id);
-      return res.status(404).json({ error: 'Record not found' });
+// Submit milk route (Farmer only)
+router.post(
+  '/api/milk/submit',
+  authenticateToken,
+  restrictToRole(['farmer']),
+  async (req, res) => {
+    try {
+      const { litres, price_per_litre } = req.body;
+      validateRequest(req, res, ['litres', 'price_per_litre']);
+      if (litres <= 0 || price_per_litre <= 0) {
+        return res.status(400).json({ success: false, error: 'Litres and price must be positive' });
+      }
+      const result = await pool.query(
+        'INSERT INTO milk_submissions (farmer_id, litres, price_per_litre, submission_date, created_at) VALUES ($1, $2, $3, NOW(), NOW()) RETURNING id, litres, price_per_litre, submission_date',
+        [req.user.id, litres, price_per_litre]
+      );
+      res.status(200).json({ success: true, message: 'Milk submitted successfully', submission: result.rows[0] });
+    } catch (error) {
+      console.error('Submit milk error:', error);
+      res.status(500).json({ success: false, error: 'Server error' });
     }
-    console.log('Record deleted by admin:', id);
-    res.status(200).json({ message: 'Record deleted' });
-  } catch (err) {
-    console.error('Delete record error:', err);
-    res.status(500).json({ error: 'Failed to delete record' });
   }
-});
+);
 
-// Add Yogurt Type (Seller)
-app.post('/yogurt_types', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'seller') {
-    console.log('Seller access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Seller access required' });
-  }
-  const { name } = req.body;
-  if (!name) {
-    console.log('Missing name in /yogurt_types:', req.body);
-    return res.status(400).json({ error: 'Name is required' });
-  }
-  try {
-    const result = await pool.query(
-      'INSERT INTO yogurt_types (name, created_by) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING RETURNING id',
-      [name, req.user.id]
-    );
-    if (result.rowCount === 0) {
-      console.log('Yogurt type already exists:', name);
-      return res.status(400).json({ error: 'Yogurt type already exists' });
+// Send message route (Admin only)
+router.post(
+  '/api/messages/send',
+  authenticateToken,
+  restrictToRole(['admin']),
+  async (req, res) => {
+    try {
+      const { content } = req.body;
+      validateRequest(req, res, ['content']);
+      const result = await pool.query(
+        'INSERT INTO messages (admin_id, content, created_at) VALUES ($1, $2, NOW()) RETURNING id, content, created_at',
+        [req.user.id, content]
+      );
+      res.status(200).json({ success: true, message: 'Message sent successfully', data: result.rows[0] });
+    } catch (error) {
+      console.error('Send message error:', error);
+      res.status(500).json({ success: false, error: 'Server error' });
     }
-    console.log('Yogurt type added by:', req.user.email, 'Name:', name);
-    res.status(201).json({ id: result.rows[0].id, message: 'Yogurt type added' });
-  } catch (err) {
-    console.error('Add yogurt type error:', err);
-    res.status(500).json({ error: 'Failed to add yogurt type' });
   }
-});
+);
 
-// Fetch Yogurt Types (Seller)
-app.get('/yogurt_types', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'seller') {
-    console.log('Seller access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Seller access required' });
-  }
-  try {
-    const result = await pool.query('SELECT id, name FROM yogurt_types');
-    console.log('Yogurt types fetched for:', req.user.email, 'Count:', result.rows.length);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Fetch yogurt types error:', err);
-    res.status(500).json({ error: 'Failed to fetch yogurt types' });
-  }
-});
-
-// Fetch Daily Totals (Seller)
-app.get('/daily_totals', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'seller') {
-    console.log('Seller access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Seller access required' });
-  }
-  try {
-    const result = await pool.query(
-      `SELECT yt.name, SUM(r.liters) as total_liters, SUM(r.amount_sold) as total_amount 
-       FROM records r 
-       JOIN yogurt_types yt ON r.yogurt_type_id = yt.id 
-       WHERE r.user_id = $1 AND DATE(r.created_at) = CURRENT_DATE 
-       GROUP BY yt.name`,
-      [req.user.id]
-    );
-    console.log('Daily totals fetched for:', req.user.email, 'Count:', result.rows.length);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Fetch daily totals error:', err);
-    res.status(500).json({ error: 'Failed to fetch daily totals' });
-  }
-});
-
-// Fetch Seller Summary
-app.get('/seller_summary', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'seller') {
-    console.log('Seller access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Seller access required' });
-  }
-  try {
-    const result = await pool.query(
-      `SELECT SUM(liters) as total_liters, SUM(amount_sold) as total_revenue 
-       FROM records 
-       WHERE user_id = $1`,
-      [req.user.id]
-    );
-    console.log('Seller summary fetched for:', req.user.email);
-    res.json({
-      total_liters: result.rows[0].total_liters || 0,
-      total_revenue: result.rows[0].total_revenue || 0
-    });
-  } catch (err) {
-    console.error('Fetch seller summary error:', err);
-    res.status(500).json({ error: 'Failed to fetch summary' });
-  }
-});
-
-// Messages (for AdminDashboard and Seller/Farmer)
-app.post('/messages', authenticateToken, async (req, res) => {
-  const { user_id, message } = req.body;
-  if (!user_id || !message) {
-    console.log('Missing fields in /messages:', req.body);
-    return res.status(400).json({ error: 'User ID and message are required' });
-  }
-  try {
-    const result = await pool.query(
-      'INSERT INTO messages (user_id, message, created_at) VALUES ($1, $2, NOW()) RETURNING id, user_id, message, created_at',
-      [user_id, message]
-    );
-    console.log('Message sent by:', req.user.email, 'to user:', user_id);
-    res.status(201).json({ id: result.rows[0].id, message: 'Message sent', data: result.rows[0] });
-  } catch (err) {
-    console.error('Send message error:', err);
-    res.status(500).json({ error: 'Failed to send message' });
-  }
-});
-
-// Fetch Messages (Admin, Seller, Farmer)
-app.get('/messages', authenticateToken, async (req, res) => {
-  try {
-    let query = 'SELECT id, user_id, message, created_at FROM messages';
-    const params = [];
-    if (req.user.role === 'seller' || req.user.role === 'farmer') {
-      query += ' WHERE user_id = $1';
-      params.push(req.user.id);
+// Fetch messages route (Farmer only)
+router.get(
+  '/api/messages/messages',
+  authenticateToken,
+  restrictToRole(['farmer']),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT m.id, m.content, m.created_at, u.name as admin_name
+        FROM messages m
+        JOIN users u ON m.admin_id = u.id
+        ORDER BY m.created_at DESC
+        `
+      );
+      res.json(result.rows);
+    } catch (error) {
+      console.error('Fetch messages error:', error);
+      res.status(500).json({ success: false, error: 'Server error' });
     }
-    query += ' ORDER BY created_at DESC';
-    const result = await pool.query(query, params);
-    console.log('Messages fetched for:', req.user.email, 'Role:', req.user.role, 'Count:', result.rows.length);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Fetch messages error:', err);
-    res.status(500).json({ error: 'Failed to fetch messages' });
   }
-});
+);
 
-// Admin Endpoints
-app.get('/users', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  try {
-    const result = await pool.query('SELECT id, email, name, role FROM users');
-    console.log('Users fetched by admin:', req.user.email, 'Count:', result.rows.length);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Fetch users error:', err);
-    res.status(500).json({ error: 'Failed to fetch users' });
-  }
-});
-
-app.post('/users', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  const { email, password, name, role } = req.body;
-  if (!email || !password || !name || !role) {
-    console.log('Missing fields in /users:', req.body);
-    return res.status(400).json({ error: 'All fields are required' });
-  }
-  try {
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      'INSERT INTO users (email, password, name, role) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING RETURNING id',
-      [email.toLowerCase(), hashedPassword, name, role]
-    );
-    if (result.rowCount === 0) {
-      console.log('User already exists:', email);
-      return res.status(400).json({ error: 'User already exists' });
+// Fetch yogurts route (Seller only)
+router.get(
+  '/api/yogurt',
+  authenticateToken,
+  restrictToRole(['seller']),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        'SELECT id, name, price FROM yogurts WHERE seller_id = $1 ORDER BY created_at DESC',
+        [req.user.id]
+      );
+      res.json(result.rows);
+    } catch (error) {
+      console.error('Fetch yogurts error:', error);
+      res.status(500).json({ success: false, error: 'Server error' });
     }
-    console.log('User added by admin:', email);
-    res.status(201).json({ id: result.rows[0].id });
-  } catch (err) {
-    console.error('Add user error:', err);
-    res.status(500).json({ error: 'Failed to add user' });
   }
-});
+);
 
-app.delete('/users/:id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  const { id } = req.params;
-  try {
-    const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING *', [id]);
-    if (result.rowCount === 0) {
-      console.log('User not found for deletion:', id);
-      return res.status(404).json({ error: 'User not found' });
+// Add yogurt route (Seller only)
+router.post(
+  '/api/yogurt/add',
+  authenticateToken,
+  restrictToRole(['seller']),
+  async (req, res) => {
+    try {
+      const { name, price } = req.body;
+      validateRequest(req, res, ['name', 'price']);
+      if (price <= 0) {
+        return res.status(400).json({ success: false, error: 'Price must be positive' });
+      }
+      const result = await pool.query(
+        'INSERT INTO yogurts (seller_id, name, price, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id, name, price',
+        [req.user.id, name, price]
+      );
+      res.status(200).json({ success: true, message: 'Yogurt added successfully', yogurt: result.rows[0] });
+    } catch (error) {
+      console.error('Add yogurt error:', error);
+      res.status(500).json({ success: false, error: 'Server error' });
     }
-    console.log('User deleted by admin:', id);
-    res.status(200).json({ message: 'User deleted' });
-  } catch (err) {
-    console.error('Delete user error:', err);
-    res.status(500).json({ error: 'Failed to delete user' });
   }
-});
+);
 
-app.get('/analytics', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'admin') {
-    console.log('Admin access denied for:', req.user.email, 'on', req.path);
-    return res.status(403).json({ error: 'Admin access required' });
+// Sell yogurt route (Seller only)
+router.post(
+  '/api/yogurt/sell',
+  authenticateToken,
+  restrictToRole(['seller']),
+  async (req, res) => {
+    try {
+      const { yogurt_id, quantity, payment_method } = req.body;
+      validateRequest(req, res, ['yogurt_id', 'quantity', 'payment_method']);
+      if (quantity <= 0) {
+        return res.status(400).json({ success: false, error: 'Quantity must be positive' });
+      }
+      const validPaymentMethods = ['cash', 'mpesa'];
+      if (!validPaymentMethods.includes(payment_method)) {
+        return res.status(400).json({ success: false, error: 'Invalid payment method' });
+      }
+      const yogurtCheck = await pool.query('SELECT * FROM yogurts WHERE id = $1 AND seller_id = $2', [yogurt_id, req.user.id]);
+      if (yogurtCheck.rows.length === 0) {
+        return res.status(404).json({ success: false, error: 'Yogurt not found' });
+      }
+      const result = await pool.query(
+        'INSERT INTO yogurt_sales (seller_id, yogurt_id, quantity, payment_method, sale_date, created_at) VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING id, yogurt_id, quantity, payment_method, sale_date',
+        [req.user.id, yogurt_id, quantity, payment_method]
+      );
+      res.status(200).json({ success: true, message: 'Sale recorded successfully', sale: result.rows[0] });
+    } catch (error) {
+      console.error('Sell yogurt error:', error);
+      res.status(500).json({ success: false, error: 'Server error' });
+    }
   }
-  try {
-    const farmerResult = await pool.query(
-      'SELECT SUM(liters) as total_liters, SUM(liters * COALESCE(price_per_liter, 0)) as total_revenue FROM records WHERE role = $1',
-      ['farmer']
-    );
-    const sellerResult = await pool.query(
-      'SELECT SUM(liters) as total_liters, SUM(amount_sold) as total_revenue FROM records WHERE role = $1',
-      ['seller']
-    );
-    console.log('Analytics fetched by admin:', req.user.email);
-    res.json({
-      farmer: {
-        total_liters: farmerResult.rows[0].total_liters || 0,
-        total_revenue: farmerResult.rows[0].total_revenue || 0,
-      },
-      seller: {
-        total_liters: sellerResult.rows[0].total_liters || 0,
-        total_revenue: sellerResult.rows[0].total_revenue || 0,
-      },
-    });
-  } catch (err) {
-    console.error('Fetch analytics error:', err);
-    res.status(500).json({ error: 'Failed to fetch analytics' });
+);
+
+// Fetch daily sales route (Seller only)
+router.get(
+  '/api/yogurt/daily-sales',
+  authenticateToken,
+  restrictToRole(['seller']),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT ys.id, y.name, ys.quantity, ys.payment_method, y.price, ys.sale_date
+        FROM yogurt_sales ys
+        JOIN yogurts y ON ys.yogurt_id = y.id
+        WHERE ys.seller_id = $1
+        AND DATE(ys.sale_date) = CURRENT_DATE
+        ORDER BY ys.sale_date DESC
+        `,
+        [req.user.id]
+      );
+      const total = result.rows.reduce((sum, sale) => sum + (sale.quantity * sale.price), 0);
+      res.json({
+        success: true,
+        sales: result.rows,
+        total,
+      });
+    } catch (error) {
+      console.error('Fetch daily sales error:', error);
+      res.status(500).json({ success: false, error: 'Server error' });
+    }
   }
-});
+);
 
-// Ping Endpoint for Debugging
-app.get('/ping', (req, res) => {
-  console.log('Ping received at', new Date().toISOString());
-  res.json({ message: 'Server is alive', timestamp: new Date().toISOString() });
-});
-
-// Error Handling Middleware
-app.use((err, req, res, next) => {
-  console.error('Server error:', err.stack);
-  res.status(500).json({ error: 'Something went wrong on the server!' });
-});
-
-// 404 Handler
-app.use((req, res) => {
-  console.log('404 Not Found:', req.path);
-  res.status(404).json({ error: 'Route not found' });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Server running on port', PORT));
+module.exports = router;
