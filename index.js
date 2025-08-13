@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const { Pool } = require('pg');
-const nodemailer = require('nodemailer');
 const routes = require('./routes');
 
 dotenv.config();
@@ -22,23 +21,6 @@ pool.connect((err, client, release) => {
   }
   console.log('Database connected successfully');
   release();
-});
-
-// Configure nodemailer
-const transporter = nodemailer.createTransport({
-  service: process.env.EMAIL_SERVICE || 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
-
-transporter.verify((error, success) => {
-  if (error) {
-    console.error('Nodemailer configuration error:', error.message, error.stack);
-    process.exit(1);
-  }
-  console.log('Nodemailer configured successfully');
 });
 
 const app = express();
