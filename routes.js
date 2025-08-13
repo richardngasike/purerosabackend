@@ -1,7 +1,6 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
 const { Pool } = require('pg');
 const router = express.Router();
 
@@ -9,15 +8,6 @@ const router = express.Router();
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://purerosadb_user:eLrws1GTCdlwqMeSF56BMFaHKfBm7cOU@dpg-d2ab4h9r0fns7396k8t0-a/purerosadb',
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-});
-
-// Configure nodemailer
-const transporter = nodemailer.createTransport({
-  service: process.env.EMAIL_SERVICE || 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
 });
 
 // Middleware to validate request body
@@ -123,74 +113,6 @@ router.post('/login', async (req, res) => {
     });
   } catch (error) {
     console.error('Login error:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Reset password request route
-router.post('/reset-password', async (req, res) => {
-  try {
-    const { email } = req.body;
-    validateRequest(req, res, ['email']);
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-    const resetToken = jwt.sign(
-      { id: result.rows[0].id, email },
-      process.env.JWT_SECRET,
-      { expiresIn: '15m' }
-    );
-    await pool.query(
-      'INSERT INTO password_resets (user_id, token, expires_at) VALUES ($1, $2, NOW() + INTERVAL \'15 minutes\')',
-      [result.rows[0].id, resetToken]
-    );
-    const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
-    await transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to: email,
-      subject: 'PureRosaMilk Password Reset',
-      html: `
-        <p>You requested a password reset for your PureRosaMilk account.</p>
-        <p>Click <a href="${resetUrl}">here</a> to reset your password.</p>
-        <p>This link will expire in 15 minutes.</p>
-      `,
-    });
-    res.json({ success: true, message: 'Password reset link sent' });
-  } catch (error) {
-    console.error('Password reset error:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Reset password confirmation route
-router.post('/reset-password/confirm', async (req, res) => {
-  try {
-    const { token, newPassword } = req.body;
-    validateRequest(req, res, ['token', 'newPassword']);
-    let decoded;
-    try {
-      decoded = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (error) {
-      console.error('Token verification error:', error.message);
-      return res.status(400).json({ success: false, error: 'Invalid or expired token' });
-    }
-    const result = await pool.query(
-      'SELECT * FROM password_resets WHERE token = $1 AND expires_at > NOW()',
-      [token]
-    );
-    if (result.rows.length === 0) {
-      return res.status(400).json({ success: false, error: 'Invalid or expired token' });
-    }
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-    await pool.query('UPDATE users SET password = $1 WHERE id = $2', [
-      hashedPassword,
-      decoded.id,
-    ]);
-    await pool.query('DELETE FROM password_resets WHERE token = $1', [token]);
-    res.json({ success: true, message: 'Password reset successfully' });
-  } catch (error) {
-    console.error('Password reset confirmation error:', error.message, error.stack);
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
