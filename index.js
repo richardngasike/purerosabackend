@@ -9,13 +9,10 @@ const routes = require('./routes');
 dotenv.config();
 console.log('Environment variables loaded');
 
-// Initialize PostgreSQL connection
+// Initialize PostgreSQL connection using the database URL
 const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT || 5432,
+  connectionString: process.env.DATABASE_URL || 'postgresql://purerosadb_user:eLrws1GTCdlwqMeSF56BMFaHKfBm7cOU@dpg-d2ab4h9r0fns7396k8t0-a/purerosadb',
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
 
 pool.connect((err, client, release) => {
@@ -60,7 +57,7 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK' });
 });
 
-// Mount routes under /api/auth
+// Mount routes
 app.use('/api/auth', routes);
 app.use('/api/milk', routes);
 app.use('/api/messages', routes);
