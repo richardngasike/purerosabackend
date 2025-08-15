@@ -371,6 +371,29 @@ app.get('/api/milk/monthly-totals', authenticateToken, restrictToRole(['admin'])
   }
 });
 
+// Fetch monthly milk totals for authenticated farmer
+app.get('/api/milk/monthly-totals/farmer', authenticateToken, restrictToRole(['farmer']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT 
+        DATE_TRUNC('month', ms.submission_date) AS month,
+        SUM(ms.litres) AS total_litres,
+        SUM(ms.litres * ms.price_per_litre) AS total_value
+      FROM milk_submissions ms
+      WHERE ms.farmer_id = $1
+      GROUP BY DATE_TRUNC('month', ms.submission_date)
+      ORDER BY month DESC
+      `,
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch farmer monthly milk totals error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 // Global error handler
 app.use((err, req, res, next) => {
   console.error('Global error handler:', err.message, err.stack);
