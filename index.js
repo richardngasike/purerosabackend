@@ -393,6 +393,58 @@ app.get('/api/milk/monthly-totals/farmer', authenticateToken, restrictToRole(['f
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
+// ... (Previous server code remains unchanged up to the yogurt-related endpoints)
+
+// Yogurt: Daily Sales
+app.get('/api/yogurt/daily-sales', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT ys.id, y.name, ys.quantity, ys.payment_method, y.price, ys.sale_date
+      FROM yogurt_sales ys
+      JOIN yogurts y ON ys.yogurt_id = y.id
+      WHERE ys.seller_id = $1
+      AND DATE(ys.sale_date) = CURRENT_DATE
+      ORDER BY ys.sale_date DESC
+      `,
+      [req.user.id]
+    );
+    const total = result.rows.reduce((sum, sale) => sum + (sale.quantity * sale.price), 0);
+    res.json({
+      success: true,
+      sales: result.rows,
+      total,
+    });
+  } catch (error) {
+    console.error('Fetch daily sales error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Fetch monthly yogurt sales for authenticated seller
+app.get('/api/yogurt/monthly-sales/seller', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT 
+        DATE_TRUNC('month', ys.sale_date) AS month,
+        SUM(ys.quantity) AS total_quantity,
+        SUM(ys.quantity * y.price) AS total_value
+      FROM yogurt_sales ys
+      JOIN yogurts y ON ys.yogurt_id = y.id
+      WHERE ys.seller_id = $1
+      GROUP BY DATE_TRUNC('month', ys.sale_date)
+      ORDER BY month DESC
+      `,
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch seller monthly yogurt sales error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 
 // Global error handler
 app.use((err, req, res, next) => {
@@ -423,3 +475,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+
