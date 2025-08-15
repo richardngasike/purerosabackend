@@ -499,6 +499,53 @@ app.get('/api/yogurt/admin/monthly-sales', authenticateToken, restrictToRole(['a
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
+// ... (Previous server code remains unchanged)
+
+// Fetch all sellers (for admin dropdown)
+app.get('/api/users/sellers', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, name
+      FROM users
+      WHERE role = 'seller'
+      ORDER BY name ASC
+      `
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch sellers error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Fetch monthly yogurt sales for a specific seller (admin access)
+app.get('/api/yogurt/monthly-sales/seller/:sellerId', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const sellerId = parseInt(req.params.sellerId);
+    if (isNaN(sellerId)) {
+      return res.status(400).json({ success: false, error: 'Invalid seller ID' });
+    }
+    const result = await pool.query(
+      `
+      SELECT 
+        DATE_TRUNC('month', ys.sale_date) AS month,
+        SUM(ys.quantity) AS total_quantity,
+        SUM(ys.quantity * y.price) AS total_value
+      FROM yogurt_sales ys
+      JOIN yogurts y ON ys.yogurt_id = y.id
+      WHERE ys.seller_id = $1
+      GROUP BY DATE_TRUNC('month', ys.sale_date)
+      ORDER BY month DESC
+      `,
+      [sellerId]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch seller monthly yogurt sales error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
 
 
 
@@ -531,5 +578,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+
 
 
