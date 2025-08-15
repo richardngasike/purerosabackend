@@ -36,7 +36,7 @@ const app = express();
 
 // Middleware
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000', // Update with your Flutter app URL
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
@@ -328,6 +328,45 @@ app.get('/api/yogurt/daily-sales', authenticateToken, restrictToRole(['seller'])
     });
   } catch (error) {
     console.error('Fetch daily sales error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Fetch all farmers (admin-only)
+app.get('/api/users/farmers', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, name, email, phone FROM users WHERE role = $1 ORDER BY name ASC',
+      ['farmer']
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch farmers error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Fetch monthly milk totals by farmer (admin-only)
+app.get('/api/milk/monthly-totals', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT 
+        u.id AS farmer_id,
+        u.name AS farmer_name,
+        DATE_TRUNC('month', ms.submission_date) AS month,
+        SUM(ms.litres) AS total_litres,
+        SUM(ms.litres * ms.price_per_litre) AS total_value
+      FROM milk_submissions ms
+      JOIN users u ON ms.farmer_id = u.id
+      WHERE u.role = 'farmer'
+      GROUP BY u.id, u.name, DATE_TRUNC('month', ms.submission_date)
+      ORDER BY month DESC, u.name ASC
+      `
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch monthly milk totals error:', error.message, error.stack);
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
