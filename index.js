@@ -444,6 +444,62 @@ app.get('/api/yogurt/monthly-sales/seller', authenticateToken, restrictToRole(['
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
+// Yogurt: Daily Sales for Admin
+app.get('/api/yogurt/admin/daily-sales', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT 
+        ys.id,
+        y.name AS yogurt_name,
+        ys.quantity,
+        ys.payment_method,
+        y.price,
+        ys.sale_date,
+        u.id AS seller_id,
+        u.name AS seller_name
+      FROM yogurt_sales ys
+      JOIN yogurts y ON ys.yogurt_id = y.id
+      JOIN users u ON ys.seller_id = u.id
+      WHERE DATE(ys.sale_date) = CURRENT_DATE
+      ORDER BY ys.sale_date DESC
+      `
+    );
+    const total = result.rows.reduce((sum, sale) => sum + (sale.quantity * sale.price), 0);
+    res.json({
+      success: true,
+      sales: result.rows,
+      total,
+    });
+  } catch (error) {
+    console.error('Fetch admin daily yogurt sales error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Yogurt: Monthly Sales for Admin
+app.get('/api/yogurt/admin/monthly-sales', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT 
+        DATE_TRUNC('month', ys.sale_date) AS month,
+        SUM(ys.quantity) AS total_quantity,
+        SUM(ys.quantity * y.price) AS total_value,
+        COUNT(DISTINCT ys.seller_id) AS seller_count
+      FROM yogurt_sales ys
+      JOIN yogurts y ON ys.yogurt_id = y.id
+      GROUP BY DATE_TRUNC('month', ys.sale_date)
+      ORDER BY month DESC
+      `
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch admin monthly yogurt sales error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 
 
 // Global error handler
@@ -475,4 +531,5 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+
 
