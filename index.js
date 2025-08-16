@@ -1,10 +1,11 @@
-console.log('Starting PureRosa backend...');
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+
+const app = express();
 
 // Load environment variables
 dotenv.config();
@@ -32,11 +33,9 @@ pool.connect((err, client, release) => {
   release();
 });
 
-const app = express();
-
 // Middleware
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000', // Update with your Flutter app URL
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
@@ -250,7 +249,7 @@ app.get('/api/messages', authenticateToken, restrictToRole(['farmer']), async (r
 app.get('/api/yogurt', authenticateToken, restrictToRole(['seller']), async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, name, price FROM yogurts WHERE seller_id = $1 ORDER BY created_at DESC',
+      'SELECT id, name, price, quantity FROM yogurts WHERE seller_id = $1 ORDER BY created_at DESC',
       [req.user.id]
     );
     res.json({ success: true, data: result.rows });
@@ -263,18 +262,59 @@ app.get('/api/yogurt', authenticateToken, restrictToRole(['seller']), async (req
 // Yogurt: Add
 app.post('/api/yogurt/add', authenticateToken, restrictToRole(['seller']), async (req, res) => {
   try {
-    const { name, price } = req.body;
-    validateRequest(req, res, ['name', 'price']);
-    if (price <= 0) {
-      return res.status(400).json({ success: false, error: 'Price must be positive' });
+    const { name, price, quantity } = req.body;
+    validateRequest(req, res, ['name', 'price', 'quantity']);
+    if (price <= 0 || quantity < 0) {
+      return res.status(400).json({ success: false, error: 'Price must be positive and quantity must be non-negative' });
     }
     const result = await pool.query(
-      'INSERT INTO yogurts (seller_id, name, price, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id, name, price',
-      [req.user.id, name, price]
+      'INSERT INTO yogurts (seller_id, name, price, quantity, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, name, price, quantity',
+      [req.user.id, name, price, quantity]
     );
     res.status(200).json({ success: true, message: 'Yogurt added successfully', yogurt: result.rows[0] });
   } catch (error) {
     console.error('Add yogurt error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Yogurt: Update Quantity
+app.put('/api/yogurt/:id', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { quantity } = req.body;
+    validateRequest(req, res, ['quantity']);
+    if (quantity < 0) {
+      return res.status(400).json({ success: false, error: 'Quantity must be non-negative' });
+    }
+    const result = await pool.query(
+      'UPDATE yogurts SET quantity = $1 WHERE id = $2 AND seller_id = $3 RETURNING id, name, price, quantity',
+      [quantity, id, req.user.id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: 'Yogurt not found or unauthorized' });
+    }
+    res.status(200).json({ success: true, message: 'Yogurt quantity updated successfully', yogurt: result.rows[0] });
+  } catch (error) {
+    console.error('Update yogurt error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Yogurt: Delete
+app.delete('/api/yogurt/:id', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'DELETE FROM yogurts WHERE id = $1 AND seller_id = $2 RETURNING id',
+      [id, req.user.id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: 'Yogurt not found or unauthorized' });
+    }
+    res.status(200).json({ success: true, message: 'Yogurt deleted successfully' });
+  } catch (error) {
+    console.error('Delete yogurt error:', error.message, error.stack);
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
@@ -291,13 +331,24 @@ app.post('/api/yogurt/sell', authenticateToken, restrictToRole(['seller']), asyn
     if (!validPaymentMethods.includes(payment_method)) {
       return res.status(400).json({ success: false, error: 'Invalid payment method' });
     }
-    const yogurtCheck = await pool.query('SELECT * FROM yogurts WHERE id = $1 AND seller_id = $2', [yogurt_id, req.user.id]);
+    const yogurtCheck = await pool.query(
+      'SELECT id, name, price, quantity FROM yogurts WHERE id = $1 AND seller_id = $2',
+      [yogurt_id, req.user.id]
+    );
     if (yogurtCheck.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Yogurt not found' });
+      return res.status(404).json({ success: false, error: 'Yogurt not found or unauthorized' });
     }
+    const yogurt = yogurtCheck.rows[0];
+    if (yogurt.quantity < quantity) {
+      return res.status(400).json({ success: false, error: 'Insufficient stock' });
+    }
+    await pool.query(
+      'UPDATE yogurts SET quantity = quantity - $1 WHERE id = $2',
+      [quantity, yogurt_id]
+    );
     const result = await pool.query(
-      'INSERT INTO yogurt_sales (seller_id, yogurt_id, quantity, payment_method, sale_date, created_at) VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING id, yogurt_id, quantity, payment_method, sale_date',
-      [req.user.id, yogurt_id, quantity, payment_method]
+      'INSERT INTO yogurt_sales (seller_id, yogurt_id, quantity, payment_method, price, sale_date, created_at) VALUES ($1, $2, $3, $4, $5, NOW(), NOW()) RETURNING id, yogurt_id, quantity, payment_method, price, sale_date',
+      [req.user.id, yogurt_id, quantity, payment_method, yogurt.price]
     );
     res.status(200).json({ success: true, message: 'Sale recorded successfully', sale: result.rows[0] });
   } catch (error) {
@@ -311,7 +362,7 @@ app.get('/api/yogurt/daily-sales', authenticateToken, restrictToRole(['seller'])
   try {
     const result = await pool.query(
       `
-      SELECT ys.id, y.name, ys.quantity, ys.payment_method, y.price, ys.sale_date
+      SELECT ys.id, y.name, ys.quantity, ys.payment_method, ys.price, ys.sale_date
       FROM yogurt_sales ys
       JOIN yogurts y ON ys.yogurt_id = y.id
       WHERE ys.seller_id = $1
@@ -328,6 +379,86 @@ app.get('/api/yogurt/daily-sales', authenticateToken, restrictToRole(['seller'])
     });
   } catch (error) {
     console.error('Fetch daily sales error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Yogurt: Monthly Sales for Seller
+app.get('/api/yogurt/monthly-sales/seller', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT 
+        DATE_TRUNC('month', ys.sale_date) AS month,
+        SUM(ys.quantity) AS total_quantity,
+        SUM(ys.quantity * ys.price) AS total_value
+      FROM yogurt_sales ys
+      JOIN yogurts y ON ys.yogurt_id = y.id
+      WHERE ys.seller_id = $1
+      GROUP BY DATE_TRUNC('month', ys.sale_date)
+      ORDER BY month DESC
+      `,
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch seller monthly yogurt sales error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Yogurt: Daily Sales for Admin
+app.get('/api/yogurt/admin/daily-sales', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT 
+        ys.id,
+        y.name AS yogurt_name,
+        ys.quantity,
+        ys.payment_method,
+        ys.price,
+        ys.sale_date,
+        u.id AS seller_id,
+        u.name AS seller_name
+      FROM yogurt_sales ys
+      JOIN yogurts y ON ys.yogurt_id = y.id
+      JOIN users u ON ys.seller_id = u.id
+      WHERE DATE(ys.sale_date) = CURRENT_DATE
+      ORDER BY ys.sale_date DESC
+      `
+    );
+    const total = result.rows.reduce((sum, sale) => sum + (sale.quantity * sale.price), 0);
+    res.json({
+      success: true,
+      sales: result.rows,
+      total,
+    });
+  } catch (error) {
+    console.error('Fetch admin daily yogurt sales error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Yogurt: Monthly Sales for Admin
+app.get('/api/yogurt/admin/monthly-sales', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT 
+        DATE_TRUNC('month', ys.sale_date) AS month,
+        SUM(ys.quantity) AS total_quantity,
+        SUM(ys.quantity * ys.price) AS total_value,
+        COUNT(DISTINCT ys.seller_id) AS seller_count
+      FROM yogurt_sales ys
+      JOIN yogurts y ON ys.yogurt_id = y.id
+      GROUP BY DATE_TRUNC('month', ys.sale_date)
+      ORDER BY month DESC
+      `
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch admin monthly yogurt sales error:', error.message, error.stack);
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
@@ -393,113 +524,6 @@ app.get('/api/milk/monthly-totals/farmer', authenticateToken, restrictToRole(['f
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
-// ... (Previous server code remains unchanged up to the yogurt-related endpoints)
-
-// Yogurt: Daily Sales
-app.get('/api/yogurt/daily-sales', authenticateToken, restrictToRole(['seller']), async (req, res) => {
-  try {
-    const result = await pool.query(
-      `
-      SELECT ys.id, y.name, ys.quantity, ys.payment_method, y.price, ys.sale_date
-      FROM yogurt_sales ys
-      JOIN yogurts y ON ys.yogurt_id = y.id
-      WHERE ys.seller_id = $1
-      AND DATE(ys.sale_date) = CURRENT_DATE
-      ORDER BY ys.sale_date DESC
-      `,
-      [req.user.id]
-    );
-    const total = result.rows.reduce((sum, sale) => sum + (sale.quantity * sale.price), 0);
-    res.json({
-      success: true,
-      sales: result.rows,
-      total,
-    });
-  } catch (error) {
-    console.error('Fetch daily sales error:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Fetch monthly yogurt sales for authenticated seller
-app.get('/api/yogurt/monthly-sales/seller', authenticateToken, restrictToRole(['seller']), async (req, res) => {
-  try {
-    const result = await pool.query(
-      `
-      SELECT 
-        DATE_TRUNC('month', ys.sale_date) AS month,
-        SUM(ys.quantity) AS total_quantity,
-        SUM(ys.quantity * y.price) AS total_value
-      FROM yogurt_sales ys
-      JOIN yogurts y ON ys.yogurt_id = y.id
-      WHERE ys.seller_id = $1
-      GROUP BY DATE_TRUNC('month', ys.sale_date)
-      ORDER BY month DESC
-      `,
-      [req.user.id]
-    );
-    res.json({ success: true, data: result.rows });
-  } catch (error) {
-    console.error('Fetch seller monthly yogurt sales error:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-// Yogurt: Daily Sales for Admin
-app.get('/api/yogurt/admin/daily-sales', authenticateToken, restrictToRole(['admin']), async (req, res) => {
-  try {
-    const result = await pool.query(
-      `
-      SELECT 
-        ys.id,
-        y.name AS yogurt_name,
-        ys.quantity,
-        ys.payment_method,
-        y.price,
-        ys.sale_date,
-        u.id AS seller_id,
-        u.name AS seller_name
-      FROM yogurt_sales ys
-      JOIN yogurts y ON ys.yogurt_id = y.id
-      JOIN users u ON ys.seller_id = u.id
-      WHERE DATE(ys.sale_date) = CURRENT_DATE
-      ORDER BY ys.sale_date DESC
-      `
-    );
-    const total = result.rows.reduce((sum, sale) => sum + (sale.quantity * sale.price), 0);
-    res.json({
-      success: true,
-      sales: result.rows,
-      total,
-    });
-  } catch (error) {
-    console.error('Fetch admin daily yogurt sales error:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Yogurt: Monthly Sales for Admin
-app.get('/api/yogurt/admin/monthly-sales', authenticateToken, restrictToRole(['admin']), async (req, res) => {
-  try {
-    const result = await pool.query(
-      `
-      SELECT 
-        DATE_TRUNC('month', ys.sale_date) AS month,
-        SUM(ys.quantity) AS total_quantity,
-        SUM(ys.quantity * y.price) AS total_value,
-        COUNT(DISTINCT ys.seller_id) AS seller_count
-      FROM yogurt_sales ys
-      JOIN yogurts y ON ys.yogurt_id = y.id
-      GROUP BY DATE_TRUNC('month', ys.sale_date)
-      ORDER BY month DESC
-      `
-    );
-    res.json({ success: true, data: result.rows });
-  } catch (error) {
-    console.error('Fetch admin monthly yogurt sales error:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-// ... (Previous server code remains unchanged)
 
 // Fetch all sellers (for admin dropdown)
 app.get('/api/users/sellers', authenticateToken, restrictToRole(['admin']), async (req, res) => {
@@ -531,7 +555,7 @@ app.get('/api/yogurt/monthly-sales/seller/:sellerId', authenticateToken, restric
       SELECT 
         DATE_TRUNC('month', ys.sale_date) AS month,
         SUM(ys.quantity) AS total_quantity,
-        SUM(ys.quantity * y.price) AS total_value
+        SUM(ys.quantity * ys.price) AS total_value
       FROM yogurt_sales ys
       JOIN yogurts y ON ys.yogurt_id = y.id
       WHERE ys.seller_id = $1
@@ -546,8 +570,6 @@ app.get('/api/yogurt/monthly-sales/seller/:sellerId', authenticateToken, restric
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
-
-
 
 // Global error handler
 app.use((err, req, res, next) => {
@@ -578,6 +600,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
-
-
-
