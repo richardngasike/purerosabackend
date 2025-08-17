@@ -4,6 +4,8 @@ const dotenv = require('dotenv');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+// Required dependencies (add to your existing server code)
+const twilio = require('twilio');
 
 const app = express();
 
@@ -571,6 +573,74 @@ app.get('/api/yogurt/monthly-sales/seller/:sellerId', authenticateToken, restric
   }
 });
 
+
+// Initialize Twilio client (add to your server setup)
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+// Other Farmers: Submit milk data and send SMS (add to routes section)
+app.post('/api/milk/other-farmers/submit', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const { farmer_name, phone_number, litres, amount, submission_date } = req.body;
+    validateRequest(req, res, ['farmer_name', 'phone_number', 'litres', 'amount', 'submission_date']);
+    
+    // Validate inputs
+    if (litres <= 0 || amount <= 0) {
+      return res.status(400).json({ success: false, error: 'Litres and amount must be positive' });
+    }
+    const phoneRegex = /^\+?\d{10,12}$/;
+    if (!phoneRegex.test(phone_number)) {
+      return res.status(400).json({ success: false, error: 'Invalid phone number format' });
+    }
+    // Validate submission_date format (ISO 8601, e.g., '2025-08-17')
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(submission_date)) {
+      return res.status(400).json({ success: false, error: 'Invalid date format (use YYYY-MM-DD)' });
+    }
+
+    // Insert submission into other_farmers_submissions table
+    const result = await pool.query(
+      'INSERT INTO other_farmers_submissions (admin_id, farmer_name, phone_number, litres, amount, submission_date, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING id, farmer_name, phone_number, litres, amount, submission_date',
+      [req.user.id, farmer_name, phone_number, litres, amount, submission_date]
+    );
+
+    // Send SMS via Twilio
+    try {
+      await twilioClient.messages.create({
+        body: `Dear ${farmer_name}, your milk submission of ${litres} litres on ${submission_date} has been recorded. Amount to be paid: $${amount.toFixed(2)}. Thank you! - PureRosa`,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: phone_number,
+      });
+      console.log(`SMS sent to ${phone_number}`);
+    } catch (smsError) {
+      console.error('SMS sending error:', smsError.message);
+      // Note: Continue with success response even if SMS fails to avoid blocking submission
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Submission recorded successfully',
+      submission: result.rows[0],
+    });
+  } catch (error) {
+    console.error('Submit other farmers milk error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Other Farmers: Fetch submissions (add to routes section)
+app.get('/api/milk/other-farmers/submissions', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, farmer_name, phone_number, litres, amount, submission_date FROM other_farmers_submissions WHERE admin_id = $1 ORDER BY submission_date DESC',
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch other farmers submissions error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 // Global error handler
 app.use((err, req, res, next) => {
   console.error('Global error handler:', err.message, err.stack);
@@ -600,3 +670,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+
