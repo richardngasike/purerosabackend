@@ -703,6 +703,23 @@ app.get('/api/yogurt/monthly-sales/seller/:sellerId', authenticateToken, restric
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
+// Simplified DELETE route with ON DELETE CASCADE
+app.delete('/api/yogurt/:id', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'DELETE FROM yogurts WHERE id = $1 AND seller_id = $2 RETURNING id',
+      [id, req.user.id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: 'Yogurt not found or unauthorized' });
+    }
+    res.status(200).json({ success: true, message: 'Yogurt deleted successfully' });
+  } catch (error) {
+    console.error('Delete yogurt error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
 
 // Global error handler
 app.use((err, req, res, next) => {
@@ -733,3 +750,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+
