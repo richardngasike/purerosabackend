@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
@@ -39,7 +40,7 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 
 // Middleware
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: process.env.FRONTEND_URL || '*', // Allow all origins for debugging; restrict in production
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
@@ -55,6 +56,7 @@ app.get('/health', (req, res) => {
 const validateRequest = (req, res, requiredFields) => {
   for (const field of requiredFields) {
     if (!req.body[field]) {
+      console.warn(`Validation failed: Missing required field: ${field}`);
       return res.status(400).json({ success: false, error: `Missing required field: ${field}` });
     }
   }
@@ -65,6 +67,7 @@ const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) {
+    console.warn('No token provided for request:', req.url);
     return res.status(401).json({ success: false, error: 'No token provided' });
   }
   try {
@@ -72,7 +75,7 @@ const authenticateToken = async (req, res, next) => {
     req.user = decoded;
     next();
   } catch (error) {
-    console.error('Token verification error:', error.message);
+    console.error('Token verification error:', error.message, error.stack);
     return res.status(401).json({ success: false, error: 'Invalid or expired token' });
   }
 };
@@ -80,12 +83,12 @@ const authenticateToken = async (req, res, next) => {
 // Role-based middleware
 const restrictToRole = (roles) => (req, res, next) => {
   if (!req.user || !roles.includes(req.user.role)) {
+    console.warn(`Unauthorized access attempt by user: ${req.user?.id} with role: ${req.user?.role}`);
     return res.status(403).json({ success: false, error: 'Unauthorized for this role' });
   }
   next();
 };
 
-// Routes
 // Auth: Register
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -113,7 +116,7 @@ app.post('/api/auth/register', async (req, res) => {
       [email, hashedPassword, role, name, phone]
     );
     const token = jwt.sign(
-      { id: result.rows[0].id, role: result.rows[0].role },
+      { id: result.rows[0].id, role: result.rows[0].role, email: result.rows[0].email, name: result.rows[0].name, phone: result.rows[0].phone },
       process.env.JWT_SECRET,
       { expiresIn: '1h' }
     );
@@ -144,7 +147,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid credentials' });
     }
     const token = jwt.sign(
-      { id: user.id, role: user.role },
+      { id: user.id, role: user.role, email: user.email, name: user.name, phone: user.phone },
       process.env.JWT_SECRET,
       { expiresIn: '1h' }
     );
@@ -253,7 +256,7 @@ app.get('/api/messages', authenticateToken, restrictToRole(['farmer']), async (r
 app.get('/api/yogurt', authenticateToken, restrictToRole(['seller']), async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, name, price, quantity FROM yogurts WHERE seller_id = $1 ORDER BY created_at DESC',
+      'SELECT id, name, price, quantity, created_at FROM yogurts WHERE seller_id = $1 ORDER BY created_at DESC',
       [req.user.id]
     );
     res.json({ success: true, data: result.rows });
@@ -271,9 +274,12 @@ app.post('/api/yogurt/add', authenticateToken, restrictToRole(['seller']), async
     if (price <= 0 || quantity < 0) {
       return res.status(400).json({ success: false, error: 'Price must be positive and quantity must be non-negative' });
     }
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      return res.status(400).json({ success: false, error: 'Name must be a non-empty string' });
+    }
     const result = await pool.query(
-      'INSERT INTO yogurts (seller_id, name, price, quantity, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, name, price, quantity',
-      [req.user.id, name, price, quantity]
+      'INSERT INTO yogurts (seller_id, name, price, quantity, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, name, price, quantity, created_at',
+      [req.user.id, name.trim(), price, quantity]
     );
     res.status(200).json({ success: true, message: 'Yogurt added successfully', yogurt: result.rows[0] });
   } catch (error) {
@@ -292,7 +298,7 @@ app.put('/api/yogurt/:id', authenticateToken, restrictToRole(['seller']), async 
       return res.status(400).json({ success: false, error: 'Quantity must be non-negative' });
     }
     const result = await pool.query(
-      'UPDATE yogurts SET quantity = $1 WHERE id = $2 AND seller_id = $3 RETURNING id, name, price, quantity',
+      'UPDATE yogurts SET quantity = $1 WHERE id = $2 AND seller_id = $3 RETURNING id, name, price, quantity, created_at',
       [quantity, id, req.user.id]
     );
     if (result.rowCount === 0) {
@@ -309,9 +315,6 @@ app.put('/api/yogurt/:id', authenticateToken, restrictToRole(['seller']), async 
 app.delete('/api/yogurt/:id', authenticateToken, restrictToRole(['seller']), async (req, res) => {
   try {
     const { id } = req.params;
-    // Delete related records to avoid foreign key constraint violation
-    await pool.query('DELETE FROM yogurt_sales WHERE yogurt_id = $1 AND seller_id = $2', [id, req.user.id]);
-    await pool.query('DELETE FROM spoiled_yogurts WHERE yogurt_id = $1 AND seller_id = $2', [id, req.user.id]);
     const result = await pool.query(
       'DELETE FROM yogurts WHERE id = $1 AND seller_id = $2 RETURNING id',
       [id, req.user.id]
@@ -328,39 +331,49 @@ app.delete('/api/yogurt/:id', authenticateToken, restrictToRole(['seller']), asy
 
 // Yogurt: Sell
 app.post('/api/yogurt/sell', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
     const { yogurt_id, quantity, payment_method } = req.body;
     validateRequest(req, res, ['yogurt_id', 'quantity', 'payment_method']);
     if (quantity <= 0) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ success: false, error: 'Quantity must be positive' });
     }
     const validPaymentMethods = ['cash', 'mpesa'];
     if (!validPaymentMethods.includes(payment_method)) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ success: false, error: 'Invalid payment method' });
     }
-    const yogurtCheck = await pool.query(
-      'SELECT id, name, price, quantity FROM yogurts WHERE id = $1 AND seller_id = $2',
+    const yogurtCheck = await client.query(
+      'SELECT id, name, price, quantity FROM yogurts WHERE id = $1 AND seller_id = $2 FOR UPDATE',
       [yogurt_id, req.user.id]
     );
     if (yogurtCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ success: false, error: 'Yogurt not found or unauthorized' });
     }
     const yogurt = yogurtCheck.rows[0];
     if (yogurt.quantity < quantity) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ success: false, error: 'Insufficient stock' });
     }
-    await pool.query(
+    await client.query(
       'UPDATE yogurts SET quantity = quantity - $1 WHERE id = $2',
       [quantity, yogurt_id]
     );
-    const result = await pool.query(
+    const result = await client.query(
       'INSERT INTO yogurt_sales (seller_id, yogurt_id, quantity, payment_method, price, sale_date, created_at) VALUES ($1, $2, $3, $4, $5, NOW(), NOW()) RETURNING id, yogurt_id, quantity, payment_method, price, sale_date',
       [req.user.id, yogurt_id, quantity, payment_method, yogurt.price]
     );
+    await client.query('COMMIT');
     res.status(200).json({ success: true, message: 'Sale recorded successfully', sale: result.rows[0] });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Sell yogurt error:', error.message, error.stack);
     res.status(500).json({ success: false, error: 'Server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -485,41 +498,65 @@ app.get('/api/spoiled-yogurt', authenticateToken, restrictToRole(['seller']), as
     );
     res.json({ success: true, data: result.rows });
   } catch (error) {
-    console.error('Error fetching spoiled yogurts:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
+    console.error('Fetch spoiled yogurts error:', {
+      message: error.message,
+      stack: error.stack,
+      userId: req.user.id,
+      endpoint: '/api/spoiled-yogurt',
+    });
+    res.status(500).json({ success: false, error: 'Failed to fetch spoiled yogurts' });
   }
 });
 
 // Spoiled Yogurt: Report
 app.post('/api/spoiled-yogurt/report', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
     const { yogurt_id, quantity, reason } = req.body;
     validateRequest(req, res, ['yogurt_id', 'quantity', 'reason']);
     if (quantity <= 0) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ success: false, error: 'Quantity must be positive' });
     }
-    const yogurt = await pool.query(
-      'SELECT id, quantity FROM yogurts WHERE id = $1 AND seller_id = $2',
+    if (typeof reason !== 'string' || reason.trim().length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, error: 'Reason must be a non-empty string' });
+    }
+    const yogurt = await client.query(
+      'SELECT id, name, quantity FROM yogurts WHERE id = $1 AND seller_id = $2 FOR UPDATE',
       [yogurt_id, req.user.id]
     );
     if (yogurt.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ success: false, error: 'Yogurt not found or unauthorized' });
     }
     if (yogurt.rows[0].quantity < quantity) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ success: false, error: 'Insufficient yogurt quantity' });
     }
-    await pool.query(
+    await client.query(
       'UPDATE yogurts SET quantity = quantity - $1 WHERE id = $2',
       [quantity, yogurt_id]
     );
-    const result = await pool.query(
-      'INSERT INTO spoiled_yogurts (seller_id, yogurt_id, quantity, reason, report_date) VALUES ($1, $2, $3, $4, NOW()) RETURNING *',
-      [req.user.id, yogurt_id, quantity, reason]
+    const result = await client.query(
+      'INSERT INTO spoiled_yogurts (seller_id, yogurt_id, quantity, reason, report_date) VALUES ($1, $2, $3, $4, NOW()) RETURNING id, yogurt_id, quantity, reason, report_date',
+      [req.user.id, yogurt_id, quantity, reason.trim()]
     );
-    res.json({ success: true, data: result.rows[0] });
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'Spoiled yogurt reported successfully', data: result.rows[0] });
   } catch (error) {
-    console.error('Error reporting spoiled yogurt:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
+    await client.query('ROLLBACK');
+    console.error('Report spoiled yogurt error:', {
+      message: error.message,
+      stack: error.stack,
+      userId: req.user.id,
+      requestBody: req.body,
+      endpoint: '/api/spoiled-yogurt/report',
+    });
+    res.status(500).json({ success: false, error: 'Failed to report spoiled yogurt' });
+  } finally {
+    client.release();
   }
 });
 
@@ -528,16 +565,22 @@ app.delete('/api/spoiled-yogurt/:id', authenticateToken, restrictToRole(['seller
   try {
     const { id } = req.params;
     const result = await pool.query(
-      'DELETE FROM spoiled_yogurts WHERE id = $1 AND seller_id = $2 RETURNING *',
+      'DELETE FROM spoiled_yogurts WHERE id = $1 AND seller_id = $2 RETURNING id',
       [id, req.user.id]
     );
-    if (result.rows.length === 0) {
+    if (result.rowCount === 0) {
       return res.status(404).json({ success: false, error: 'Spoiled yogurt record not found or unauthorized' });
     }
     res.json({ success: true, message: 'Spoiled yogurt record deleted successfully' });
   } catch (error) {
-    console.error('Error deleting spoiled yogurt:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
+    console.error('Delete spoiled yogurt error:', {
+      message: error.message,
+      stack: error.stack,
+      userId: req.user.id,
+      spoiledYogurtId: req.params.id,
+      endpoint: '/api/spoiled-yogurt/:id',
+    });
+    res.status(500).json({ success: false, error: 'Failed to delete spoiled yogurt record' });
   }
 });
 
@@ -703,27 +746,15 @@ app.get('/api/yogurt/monthly-sales/seller/:sellerId', authenticateToken, restric
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
-// Simplified DELETE route with ON DELETE CASCADE
-app.delete('/api/yogurt/:id', authenticateToken, restrictToRole(['seller']), async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await pool.query(
-      'DELETE FROM yogurts WHERE id = $1 AND seller_id = $2 RETURNING id',
-      [id, req.user.id]
-    );
-    if (result.rowCount === 0) {
-      return res.status(404).json({ success: false, error: 'Yogurt not found or unauthorized' });
-    }
-    res.status(200).json({ success: true, message: 'Yogurt deleted successfully' });
-  } catch (error) {
-    console.error('Delete yogurt error:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
 
 // Global error handler
 app.use((err, req, res, next) => {
-  console.error('Global error handler:', err.message, err.stack);
+  console.error('Global error handler:', {
+    message: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method,
+  });
   res.status(500).json({ success: false, error: 'Server error' });
 });
 
@@ -750,4 +781,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
-
