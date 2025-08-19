@@ -641,6 +641,68 @@ app.get('/api/milk/other-farmers/submissions', authenticateToken, restrictToRole
   }
 });
 
+// Get all spoiled yogurt records
+router.get('/', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT sy.id, y.name, sy.quantity, sy.reason, sy.report_date
+      FROM spoiled_yogurts sy
+      JOIN yogurts y ON sy.yogurt_id = y.id
+      ORDER BY sy.report_date DESC
+    `);
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    console.error('Error fetching spoiled yogurts:', err);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Report spoiled yogurt
+router.post('/report', authenticateToken, async (req, res) => {
+  const { yogurt_id, quantity, reason } = req.body;
+  if (!yogurt_id || !quantity || !reason) {
+    return res.status(400).json({ success: false, error: 'Missing required fields' });
+  }
+  try {
+    // Check if yogurt exists and has sufficient quantity
+    const yogurt = await pool.query('SELECT * FROM yogurts WHERE id = $1', [yogurt_id]);
+    if (yogurt.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Yogurt not found' });
+    }
+    if (yogurt.rows[0].quantity < quantity) {
+      return res.status(400).json({ success: false, error: 'Insufficient yogurt quantity' });
+    }
+
+    // Update yogurt quantity
+    await pool.query('UPDATE yogurts SET quantity = quantity - $1 WHERE id = $2', [quantity, yogurt_id]);
+
+    // Insert spoiled yogurt record
+    const result = await pool.query(
+      'INSERT INTO spoiled_yogurts (yogurt_id, quantity, reason, report_date) VALUES ($1, $2, $3, NOW()) RETURNING *',
+      [yogurt_id, quantity, reason]
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    console.error('Error reporting spoiled yogurt:', err);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Delete spoiled yogurt record
+router.delete('/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM spoiled_yogurts WHERE id = $1 RETURNING *', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Spoiled yogurt record not found' });
+    }
+    res.json({ success: true, message: 'Spoiled yogurt record deleted successfully' });
+  } catch (err) {
+    console.error('Error deleting spoiled yogurt:', err);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 // Global error handler
 app.use((err, req, res, next) => {
   console.error('Global error handler:', err.message, err.stack);
@@ -670,4 +732,5 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+
 
