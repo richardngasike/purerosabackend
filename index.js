@@ -89,6 +89,103 @@ const restrictToRole = (roles) => (req, res, next) => {
   next();
 };
 
+// Define router for expenses
+const router = express.Router();
+
+// Expenses: Get all expenses (admin-only)
+router.get('/', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, name, cost, description, category, expense_date
+      FROM expenses
+      ORDER BY expense_date DESC
+    `);
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    console.error('Error fetching expenses:', err.message, err.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Expenses: Add a new expense (admin-only)
+router.post('/add', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  const { name, cost, description, category, expense_date } = req.body;
+
+  if (!name || !cost || !description || !category || !expense_date) {
+    return res.status(400).json({ success: false, error: 'All fields are required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      INSERT INTO expenses (name, cost, description, category, expense_date)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id, name, cost, description, category, expense_date
+      `,
+      [name, cost, description, category, expense_date]
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    console.error('Error adding expense:', err.message, err.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Expenses: Edit an existing expense (admin-only)
+router.post('/edit/:id', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  const { id } = req.params;
+  const { name, cost, description, category, expense_date } = req.body;
+
+  if (!name || !cost || !description || !category || !expense_date) {
+    return res.status(400).json({ success: false, error: 'All fields are required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE expenses
+      SET name = $1, cost = $2, description = $3, category = $4, expense_date = $5
+      WHERE id = $6
+      RETURNING id, name, cost, description, category, expense_date
+      `,
+      [name, cost, description, category, expense_date, id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: 'Expense not found' });
+    }
+
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    console.error('Error updating expense:', err.message, err.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Expenses: Delete an expense (admin-only)
+router.delete('/delete/:id', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      'DELETE FROM expenses WHERE id = $1 RETURNING id',
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: 'Expense not found' });
+    }
+
+    res.json({ success: true, message: 'Expense deleted successfully' });
+  } catch (err) {
+    console.error('Error deleting expense:', err.message, err.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Mount expenses routes
+app.use('/api/expenses', router);
+
 // Auth: Register
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -746,104 +843,7 @@ app.get('/api/yogurt/monthly-sales/seller/:sellerId', authenticateToken, restric
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
-// Middleware to ensure only admins can access these routes
-const adminMiddleware = (req, res, next) => {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ success: false, error: 'Unauthorized: Admin access required' });
-  }
-  next();
-};
 
-// Get all expenses
-router.get('/', authMiddleware, adminMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT id, name, cost, description, category, expense_date
-      FROM expenses
-      ORDER BY expense_date DESC
-    `);
-    res.json({ success: true, data: result.rows });
-  } catch (err) {
-    console.error('Error fetching expenses:', err);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Add a new expense
-router.post('/add', authMiddleware, adminMiddleware, async (req, res) => {
-  const { name, cost, description, category, expense_date } = req.body;
-
-  if (!name || !cost || !description || !category || !expense_date) {
-    return res.status(400).json({ success: false, error: 'All fields are required' });
-  }
-
-  try {
-    const result = await pool.query(
-      `
-      INSERT INTO expenses (name, cost, description, category, expense_date)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING id, name, cost, description, category, expense_date
-      `,
-      [name, cost, description, category, expense_date]
-    );
-    res.json({ success: true, data: result.rows[0] });
-  } catch (err) {
-    console.error('Error adding expense:', err);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Edit an existing expense
-router.post('/edit/:id', authMiddleware, adminMiddleware, async (req, res) => {
-  const { id } = req.params;
-  const { name, cost, description, category, expense_date } = req.body;
-
-  if (!name || !cost || !description || !category || !expense_date) {
-    return res.status(400).json({ success: false, error: 'All fields are required' });
-  }
-
-  try {
-    const result = await pool.query(
-      `
-      UPDATE expenses
-      SET name = $1, cost = $2, description = $3, category = $4, expense_date = $5
-      WHERE id = $6
-      RETURNING id, name, cost, description, category, expense_date
-      `,
-      [name, cost, description, category, expense_date, id]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ success: false, error: 'Expense not found' });
-    }
-
-    res.json({ success: true, data: result.rows[0] });
-  } catch (err) {
-    console.error('Error updating expense:', err);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Delete an expense
-router.delete('/delete/:id', authMiddleware, adminMiddleware, async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const result = await pool.query(
-      'DELETE FROM expenses WHERE id = $1 RETURNING id',
-      [id]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ success: false, error: 'Expense not found' });
-    }
-
-    res.json({ success: true, message: 'Expense deleted successfully' });
-  } catch (err) {
-    console.error('Error deleting expense:', err);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
 // Global error handler
 app.use((err, req, res, next) => {
   console.error('Global error handler:', {
@@ -878,4 +878,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
-
