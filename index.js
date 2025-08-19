@@ -4,7 +4,6 @@ const dotenv = require('dotenv');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-// Required dependencies (add to your existing server code)
 const twilio = require('twilio');
 
 const app = express();
@@ -14,8 +13,8 @@ dotenv.config();
 console.log('Environment variables loaded');
 
 // Validate critical environment variables
-if (!process.env.JWT_SECRET) {
-  console.error('JWT_SECRET is not defined in .env');
+if (!process.env.JWT_SECRET || !process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
+  console.error('Missing critical environment variables (JWT_SECRET, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, or TWILIO_PHONE_NUMBER)');
   process.exit(1);
 }
 
@@ -34,6 +33,9 @@ pool.connect((err, client, release) => {
   console.log('Database connected successfully');
   release();
 });
+
+// Initialize Twilio client
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 // Middleware
 app.use(cors({
@@ -307,6 +309,9 @@ app.put('/api/yogurt/:id', authenticateToken, restrictToRole(['seller']), async 
 app.delete('/api/yogurt/:id', authenticateToken, restrictToRole(['seller']), async (req, res) => {
   try {
     const { id } = req.params;
+    // Delete related records to avoid foreign key constraint violation
+    await pool.query('DELETE FROM yogurt_sales WHERE yogurt_id = $1 AND seller_id = $2', [id, req.user.id]);
+    await pool.query('DELETE FROM spoiled_yogurts WHERE yogurt_id = $1 AND seller_id = $2', [id, req.user.id]);
     const result = await pool.query(
       'DELETE FROM yogurts WHERE id = $1 AND seller_id = $2 RETURNING id',
       [id, req.user.id]
@@ -465,6 +470,132 @@ app.get('/api/yogurt/admin/monthly-sales', authenticateToken, restrictToRole(['a
   }
 });
 
+// Spoiled Yogurt: Fetch
+app.get('/api/spoiled-yogurt', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT sy.id, y.name, sy.quantity, sy.reason, sy.report_date
+      FROM spoiled_yogurts sy
+      JOIN yogurts y ON sy.yogurt_id = y.id
+      WHERE sy.seller_id = $1
+      ORDER BY sy.report_date DESC
+      `,
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Error fetching spoiled yogurts:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Spoiled Yogurt: Report
+app.post('/api/spoiled-yogurt/report', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  try {
+    const { yogurt_id, quantity, reason } = req.body;
+    validateRequest(req, res, ['yogurt_id', 'quantity', 'reason']);
+    if (quantity <= 0) {
+      return res.status(400).json({ success: false, error: 'Quantity must be positive' });
+    }
+    const yogurt = await pool.query(
+      'SELECT id, quantity FROM yogurts WHERE id = $1 AND seller_id = $2',
+      [yogurt_id, req.user.id]
+    );
+    if (yogurt.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Yogurt not found or unauthorized' });
+    }
+    if (yogurt.rows[0].quantity < quantity) {
+      return res.status(400).json({ success: false, error: 'Insufficient yogurt quantity' });
+    }
+    await pool.query(
+      'UPDATE yogurts SET quantity = quantity - $1 WHERE id = $2',
+      [quantity, yogurt_id]
+    );
+    const result = await pool.query(
+      'INSERT INTO spoiled_yogurts (seller_id, yogurt_id, quantity, reason, report_date) VALUES ($1, $2, $3, $4, NOW()) RETURNING *',
+      [req.user.id, yogurt_id, quantity, reason]
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Error reporting spoiled yogurt:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Spoiled Yogurt: Delete
+app.delete('/api/spoiled-yogurt/:id', authenticateToken, restrictToRole(['seller']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'DELETE FROM spoiled_yogurts WHERE id = $1 AND seller_id = $2 RETURNING *',
+      [id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Spoiled yogurt record not found or unauthorized' });
+    }
+    res.json({ success: true, message: 'Spoiled yogurt record deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting spoiled yogurt:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Other Farmers: Submit milk data and send SMS
+app.post('/api/milk/other-farmers/submit', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const { farmer_name, phone_number, litres, amount, submission_date } = req.body;
+    validateRequest(req, res, ['farmer_name', 'phone_number', 'litres', 'amount', 'submission_date']);
+    if (litres <= 0 || amount <= 0) {
+      return res.status(400).json({ success: false, error: 'Litres and amount must be positive' });
+    }
+    const phoneRegex = /^\+?\d{10,12}$/;
+    if (!phoneRegex.test(phone_number)) {
+      return res.status(400).json({ success: false, error: 'Invalid phone number format' });
+    }
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(submission_date)) {
+      return res.status(400).json({ success: false, error: 'Invalid date format (use YYYY-MM-DD)' });
+    }
+    const result = await pool.query(
+      'INSERT INTO other_farmers_submissions (admin_id, farmer_name, phone_number, litres, amount, submission_date, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING id, farmer_name, phone_number, litres, amount, submission_date',
+      [req.user.id, farmer_name, phone_number, litres, amount, submission_date]
+    );
+    try {
+      await twilioClient.messages.create({
+        body: `Dear ${farmer_name}, your milk submission of ${litres} litres on ${submission_date} has been recorded. Amount to be paid: $${amount.toFixed(2)}. Thank you! - PureRosa`,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: phone_number,
+      });
+      console.log(`SMS sent to ${phone_number}`);
+    } catch (smsError) {
+      console.error('SMS sending error:', smsError.message);
+    }
+    res.status(200).json({
+      success: true,
+      message: 'Submission recorded successfully',
+      submission: result.rows[0],
+    });
+  } catch (error) {
+    console.error('Submit other farmers milk error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Other Farmers: Fetch submissions
+app.get('/api/milk/other-farmers/submissions', authenticateToken, restrictToRole(['admin']), async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, farmer_name, phone_number, litres, amount, submission_date FROM other_farmers_submissions WHERE admin_id = $1 ORDER BY submission_date DESC',
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Fetch other farmers submissions error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 // Fetch all farmers (admin-only)
 app.get('/api/users/farmers', authenticateToken, restrictToRole(['admin']), async (req, res) => {
   try {
@@ -573,136 +704,6 @@ app.get('/api/yogurt/monthly-sales/seller/:sellerId', authenticateToken, restric
   }
 });
 
-
-// Initialize Twilio client (add to your server setup)
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
-// Other Farmers: Submit milk data and send SMS (add to routes section)
-app.post('/api/milk/other-farmers/submit', authenticateToken, restrictToRole(['admin']), async (req, res) => {
-  try {
-    const { farmer_name, phone_number, litres, amount, submission_date } = req.body;
-    validateRequest(req, res, ['farmer_name', 'phone_number', 'litres', 'amount', 'submission_date']);
-    
-    // Validate inputs
-    if (litres <= 0 || amount <= 0) {
-      return res.status(400).json({ success: false, error: 'Litres and amount must be positive' });
-    }
-    const phoneRegex = /^\+?\d{10,12}$/;
-    if (!phoneRegex.test(phone_number)) {
-      return res.status(400).json({ success: false, error: 'Invalid phone number format' });
-    }
-    // Validate submission_date format (ISO 8601, e.g., '2025-08-17')
-    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-    if (!dateRegex.test(submission_date)) {
-      return res.status(400).json({ success: false, error: 'Invalid date format (use YYYY-MM-DD)' });
-    }
-
-    // Insert submission into other_farmers_submissions table
-    const result = await pool.query(
-      'INSERT INTO other_farmers_submissions (admin_id, farmer_name, phone_number, litres, amount, submission_date, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING id, farmer_name, phone_number, litres, amount, submission_date',
-      [req.user.id, farmer_name, phone_number, litres, amount, submission_date]
-    );
-
-    // Send SMS via Twilio
-    try {
-      await twilioClient.messages.create({
-        body: `Dear ${farmer_name}, your milk submission of ${litres} litres on ${submission_date} has been recorded. Amount to be paid: $${amount.toFixed(2)}. Thank you! - PureRosa`,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to: phone_number,
-      });
-      console.log(`SMS sent to ${phone_number}`);
-    } catch (smsError) {
-      console.error('SMS sending error:', smsError.message);
-      // Note: Continue with success response even if SMS fails to avoid blocking submission
-    }
-
-    res.status(200).json({
-      success: true,
-      message: 'Submission recorded successfully',
-      submission: result.rows[0],
-    });
-  } catch (error) {
-    console.error('Submit other farmers milk error:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Other Farmers: Fetch submissions (add to routes section)
-app.get('/api/milk/other-farmers/submissions', authenticateToken, restrictToRole(['admin']), async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT id, farmer_name, phone_number, litres, amount, submission_date FROM other_farmers_submissions WHERE admin_id = $1 ORDER BY submission_date DESC',
-      [req.user.id]
-    );
-    res.json({ success: true, data: result.rows });
-  } catch (error) {
-    console.error('Fetch other farmers submissions error:', error.message, error.stack);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Get all spoiled yogurt records
-router.get('/', authenticateToken, async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT sy.id, y.name, sy.quantity, sy.reason, sy.report_date
-      FROM spoiled_yogurts sy
-      JOIN yogurts y ON sy.yogurt_id = y.id
-      ORDER BY sy.report_date DESC
-    `);
-    res.json({ success: true, data: result.rows });
-  } catch (err) {
-    console.error('Error fetching spoiled yogurts:', err);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Report spoiled yogurt
-router.post('/report', authenticateToken, async (req, res) => {
-  const { yogurt_id, quantity, reason } = req.body;
-  if (!yogurt_id || !quantity || !reason) {
-    return res.status(400).json({ success: false, error: 'Missing required fields' });
-  }
-  try {
-    // Check if yogurt exists and has sufficient quantity
-    const yogurt = await pool.query('SELECT * FROM yogurts WHERE id = $1', [yogurt_id]);
-    if (yogurt.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Yogurt not found' });
-    }
-    if (yogurt.rows[0].quantity < quantity) {
-      return res.status(400).json({ success: false, error: 'Insufficient yogurt quantity' });
-    }
-
-    // Update yogurt quantity
-    await pool.query('UPDATE yogurts SET quantity = quantity - $1 WHERE id = $2', [quantity, yogurt_id]);
-
-    // Insert spoiled yogurt record
-    const result = await pool.query(
-      'INSERT INTO spoiled_yogurts (yogurt_id, quantity, reason, report_date) VALUES ($1, $2, $3, NOW()) RETURNING *',
-      [yogurt_id, quantity, reason]
-    );
-    res.json({ success: true, data: result.rows[0] });
-  } catch (err) {
-    console.error('Error reporting spoiled yogurt:', err);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// Delete spoiled yogurt record
-router.delete('/:id', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  try {
-    const result = await pool.query('DELETE FROM spoiled_yogurts WHERE id = $1 RETURNING *', [id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Spoiled yogurt record not found' });
-    }
-    res.json({ success: true, message: 'Spoiled yogurt record deleted successfully' });
-  } catch (err) {
-    console.error('Error deleting spoiled yogurt:', err);
-    res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
 // Global error handler
 app.use((err, req, res, next) => {
   console.error('Global error handler:', err.message, err.stack);
@@ -732,5 +733,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
-
-
