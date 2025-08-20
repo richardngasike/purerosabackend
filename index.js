@@ -431,7 +431,7 @@ app.post('/api/yogurt/sell', authenticateToken, restrictToRole(['seller']), asyn
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { yogurt_id, quantity, payment_method } = req.body;
+    const { yogurt_id, quantity, payment_method, customer_name, notes, category } = req.body;
     validateRequest(req, res, ['yogurt_id', 'quantity', 'payment_method']);
     if (quantity <= 0) {
       await client.query('ROLLBACK');
@@ -441,6 +441,11 @@ app.post('/api/yogurt/sell', authenticateToken, restrictToRole(['seller']), asyn
     if (!validPaymentMethods.includes(payment_method)) {
       await client.query('ROLLBACK');
       return res.status(400).json({ success: false, error: 'Invalid payment method' });
+    }
+    const validCategories = ['Regular', 'Bulk', null];
+    if (category && !validCategories.includes(category)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, error: 'Invalid category' });
     }
     const yogurtCheck = await client.query(
       'SELECT id, name, price, quantity FROM yogurts WHERE id = $1 AND seller_id = $2 FOR UPDATE',
@@ -460,8 +465,8 @@ app.post('/api/yogurt/sell', authenticateToken, restrictToRole(['seller']), asyn
       [quantity, yogurt_id]
     );
     const result = await client.query(
-      'INSERT INTO yogurt_sales (seller_id, yogurt_id, quantity, payment_method, price, sale_date, created_at) VALUES ($1, $2, $3, $4, $5, NOW(), NOW()) RETURNING id, yogurt_id, quantity, payment_method, price, sale_date',
-      [req.user.id, yogurt_id, quantity, payment_method, yogurt.price]
+      'INSERT INTO yogurt_sales (seller_id, yogurt_id, quantity, payment_method, price, sale_date, customer_name, notes, category, created_at) VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, NOW()) RETURNING id, yogurt_id, quantity, payment_method, price, sale_date, customer_name, notes, category',
+      [req.user.id, yogurt_id, quantity, payment_method, yogurt.price, customer_name || null, notes || null, category || null]
     );
     await client.query('COMMIT');
     res.status(200).json({ success: true, message: 'Sale recorded successfully', sale: result.rows[0] });
@@ -474,12 +479,124 @@ app.post('/api/yogurt/sell', authenticateToken, restrictToRole(['seller']), asyn
   }
 });
 
+// Yogurt: All Sales
+app.get('/api/yogurt/all-sales', authenticateToken, restrictToRole(['seller', 'admin']), async (req, res) => {
+  try {
+    let query, params;
+    if (req.user.role === 'admin') {
+      query = `
+        SELECT 
+          ys.id, 
+          y.name, 
+          ys.quantity, 
+          ys.payment_method, 
+          ys.price, 
+          ys.sale_date,
+          ys.customer_name,
+          ys.notes,
+          ys.category,
+          u.name AS seller_name
+        FROM yogurt_sales ys
+        JOIN yogurts y ON ys.yogurt_id = y.id
+        JOIN users u ON ys.seller_id = u.id
+        ORDER BY ys.sale_date DESC
+      `;
+      params = [];
+    } else {
+      query = `
+        SELECT 
+          ys.id, 
+          y.name, 
+          ys.quantity, 
+          ys.payment_method, 
+          ys.price, 
+          ys.sale_date,
+          ys.customer_name,
+          ys.notes,
+          ys.category
+        FROM yogurt_sales ys
+        JOIN yogurts y ON ys.yogurt_id = y.id
+        WHERE ys.seller_id = $1
+        ORDER BY ys.sale_date DESC
+      `;
+      params = [req.user.id];
+    }
+    const result = await pool.query(query, params);
+    res.json({
+      success: true,
+      sales: result.rows,
+    });
+  } catch (error) {
+    console.error('Fetch all sales error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Yogurt: Delete Sale
+app.delete('/api/yogurt/sale/delete/:id', authenticateToken, restrictToRole(['seller', 'admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    let query, params;
+    if (req.user.role === 'admin') {
+      query = 'DELETE FROM yogurt_sales WHERE id = $1 RETURNING id';
+      params = [id];
+    } else {
+      query = 'DELETE FROM yogurt_sales WHERE id = $1 AND seller_id = $2 RETURNING id';
+      params = [id, req.user.id];
+    }
+    const result = await pool.query(query, params);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: 'Sale not found or unauthorized' });
+    }
+    res.json({ success: true, message: 'Sale deleted successfully' });
+  } catch (error) {
+    console.error('Delete sale error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// Yogurt: Update Sale Notes
+app.put('/api/yogurt/sale/:id/notes', authenticateToken, restrictToRole(['seller', 'admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { notes } = req.body;
+    if (notes !== null && (typeof notes !== 'string' || notes.trim().length === 0)) {
+      return res.status(400).json({ success: false, error: 'Notes must be a non-empty string or null' });
+    }
+    let query, params;
+    if (req.user.role === 'admin') {
+      query = 'UPDATE yogurt_sales SET notes = $1 WHERE id = $2 RETURNING id, notes';
+      params = [notes || null, id];
+    } else {
+      query = 'UPDATE yogurt_sales SET notes = $1 WHERE id = $2 AND seller_id = $3 RETURNING id, notes';
+      params = [notes || null, id, req.user.id];
+    }
+    const result = await pool.query(query, params);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: 'Sale not found or unauthorized' });
+    }
+    res.json({ success: true, message: 'Notes updated successfully', data: result.rows[0] });
+  } catch (error) {
+    console.error('Update sale notes error:', error.message, error.stack);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 // Yogurt: Daily Sales
 app.get('/api/yogurt/daily-sales', authenticateToken, restrictToRole(['seller']), async (req, res) => {
   try {
     const result = await pool.query(
       `
-      SELECT ys.id, y.name, ys.quantity, ys.payment_method, ys.price, ys.sale_date
+      SELECT 
+        ys.id, 
+        y.name, 
+        ys.quantity, 
+        ys.payment_method, 
+        ys.price, 
+        ys.sale_date,
+        ys.customer_name,
+        ys.notes,
+        ys.category
       FROM yogurt_sales ys
       JOIN yogurts y ON ys.yogurt_id = y.id
       WHERE ys.seller_id = $1
@@ -536,6 +653,9 @@ app.get('/api/yogurt/admin/daily-sales', authenticateToken, restrictToRole(['adm
         ys.payment_method,
         ys.price,
         ys.sale_date,
+        ys.customer_name,
+        ys.notes,
+        ys.category,
         u.id AS seller_id,
         u.name AS seller_name
       FROM yogurt_sales ys
@@ -844,21 +964,6 @@ app.get('/api/yogurt/monthly-sales/seller/:sellerId', authenticateToken, restric
   }
 });
 
-app.put('/api/milk/submissions/:id/paid', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const { isPaid } = req.body;
-  try {
-    const submission = await MilkSubmission.findById(id);
-    if (!submission) {
-      return res.status(404).json({ success: false, error: 'Submission not found' });
-    }
-    submission.isPaid = isPaid;
-    await submission.save();
-    res.status(200).json({ success: true, data: submission });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
 // Global error handler
 app.use((err, req, res, next) => {
   console.error('Global error handler:', {
@@ -893,4 +998,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
-
