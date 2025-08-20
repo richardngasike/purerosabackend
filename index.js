@@ -844,6 +844,21 @@ app.get('/api/yogurt/monthly-sales/seller/:sellerId', authenticateToken, restric
   }
 });
 
+app.put('/api/milk/submissions/:id/paid', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { isPaid } = req.body;
+  try {
+    const submission = await MilkSubmission.findById(id);
+    if (!submission) {
+      return res.status(404).json({ success: false, error: 'Submission not found' });
+    }
+    submission.isPaid = isPaid;
+    await submission.save();
+    res.status(200).json({ success: true, data: submission });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 // Global error handler
 app.use((err, req, res, next) => {
   console.error('Global error handler:', {
@@ -878,3 +893,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+
